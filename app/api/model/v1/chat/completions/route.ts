@@ -1,8 +1,8 @@
 import { gatewayModel } from "@/lib/server/config";
 import { gatewayCredential } from "@/lib/server/gateway";
-import { sessionUser } from "@/lib/server/hanko";
+import { requestUser } from "@/lib/server/auth";
 import { handleModelRequest } from "@/lib/server/model-route";
-import { quotaStore } from "@/lib/server/store";
+import { quotaStore } from "@/lib/server/db";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -10,5 +10,5 @@ export const dynamic = "force-dynamic";
 export const maxDuration = 300;
 
 export function POST(request: Request): Promise<Response> {
-  return handleModelRequest(request, { user: sessionUser, store: quotaStore, credential: gatewayCredential, model: gatewayModel() });
+  return handleModelRequest(request, { user: (request) => requestUser(request), store: quotaStore, credential: gatewayCredential, model: gatewayModel() });
 }

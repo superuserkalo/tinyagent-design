@@ -17,7 +17,7 @@ export const GRANT_HEADER = "x-tinyagent-grant";
 
 export interface ModelRouteDeps {
   user: UserLookup;
-  store: () => QuotaStore;
+  store: () => QuotaStore | Promise<QuotaStore>;
   /** AI_GATEWAY_API_KEY, else the Vercel OIDC token; null when neither exists. */
   credential: () => Promise<string | null>;
   model: string;
@@ -74,7 +74,7 @@ export async function handleModelRequest(request: Request, deps: ModelRouteDeps)
   // Counted only once the request is known to be well formed.
   let use;
   try {
-    use = await useGrant(deps.store(), grantId, user.id);
+    use = await useGrant(await deps.store(), grantId, user.id);
   } catch {
     return fail(503, "quota_unavailable", "Prompt accounting is unavailable. Try again shortly.");
   }

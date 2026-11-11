@@ -1,30 +1,20 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { FREE_PROMPTS, GRANT_MAX_REQUESTS, GRANT_TTL_SECONDS, PROMPT_RATE } from "../lib/server/config.ts";
+import { freePrompts, GRANT_MAX_REQUESTS, GRANT_TTL_SECONDS, PROMPT_RATE } from "../lib/server/config.ts";
 import { promptsLeft, startPrompt, useGrant } from "../lib/server/quota.ts";
+import { migrations, sqliteExecutor as executorFor } from "../lib/server/sqlite.ts";
 import { D1Error, MemoryQuotaStore, SQL, SqlQuotaStore, d1Executor, type QuotaStore, type SqlExecutor } from "../lib/server/store.ts";
 
-const MIGRATION = readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8");
-
-/** The production SQL, run on a local SQLite with the real migration: D1 is SQLite. */
+/** The production SQL, run on a local SQLite with the real migrations: D1 is SQLite. */
 function sqliteExecutor(): SqlExecutor {
   const db = new DatabaseSync(":memory:");
-  db.exec(MIGRATION);
-  return async (statements) => {
-    // A batch is one transaction, as D1 runs it. Parameters arrive as strings, as from D1's HTTP API.
-    db.exec("BEGIN");
-    try {
-      const results = statements.map(({ sql, params }) => db.prepare(sql).all(...params.map(String)) as Record<string, unknown>[]);
-      db.exec("COMMIT");
-      return results;
-    } catch (error) {
-      db.exec("ROLLBACK");
-      throw error;
-    }
-  };
+  for (const sql of migrations(new URL("../migrations/", import.meta.url))) db.exec(sql);
+  return executorFor(db);
 }
+
+// Most tests here count down from 3; the default for new accounts is 1.
+process.env.FREE_PROMPTS = "3";
 
 function clock(start = 1_800_000_000_000) {
   let now = start;
@@ -37,9 +27,30 @@ const stores: [string, (now: () => number) => QuotaStore][] = [
 ];
 
 for (const [name, make] of stores) {
-  test(`${name}: a new account starts with 3 free prompts`, async () => {
-    assert.equal(FREE_PROMPTS, 3);
+  test(`${name}: a new account starts with FREE_PROMPTS free prompts, 1 by default`, async () => {
     assert.equal(await promptsLeft(make(Date.now), "u1"), 3);
+    delete process.env.FREE_PROMPTS;
+    try {
+      assert.equal(freePrompts(), 1);
+      const store = make(Date.now);
+      assert.equal(await promptsLeft(store, "fresh"), 1);
+      assert.ok((await startPrompt(store, "fresh")).ok);
+      assert.equal((await startPrompt(store, "fresh")).ok, false);
+    } finally {
+      process.env.FREE_PROMPTS = "3";
+    }
+  });
+
+  test(`${name}: an existing account keeps its count when FREE_PROMPTS changes`, async () => {
+    const time = clock();
+    const store = make(time.now);
+    assert.ok((await startPrompt(store, "old", time.now())).ok); // 3 -> 2
+    process.env.FREE_PROMPTS = "1";
+    try {
+      assert.equal(await promptsLeft(store, "old"), 2);
+    } finally {
+      process.env.FREE_PROMPTS = "3";
+    }
   });
 
   test(`${name}: each prompt decrements once and the count floors at 0`, async () => {

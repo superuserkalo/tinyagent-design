@@ -1,6 +1,6 @@
 // Where prompt counts and grants live: Cloudflare D1 in deployments (over its HTTP
-// API, schema in migrations/0001_init.sql), memory only in local development without
-// D1 credentials. Every check-and-update is one SQL statement, so concurrent requests
+// API, schema in migrations/0001_init.sql); see db.ts for which database is used.
+// MemoryQuotaStore is for tests. Every check-and-update is one SQL statement, so concurrent requests
 // cannot both spend the last prompt or both slip past a grant's cap.
 
 export type GrantUse = "ok" | "missing" | "wrong_user" | "exhausted";
@@ -166,24 +166,3 @@ export class MemoryQuotaStore implements QuotaStore {
 }
 
 export class StoreUnavailableError extends Error {}
-
-let shared: QuotaStore | undefined;
-
-/**
- * Cloudflare D1 when CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_D1_DATABASE_ID and
- * CLOUDFLARE_D1_TOKEN are set. Without them, memory, but only in development;
- * anywhere else the routes answer 503.
- */
-export function quotaStore(): QuotaStore {
-  if (shared) return shared;
-  const accountId = process.env.CLOUDFLARE_ACCOUNT_ID?.trim();
-  const databaseId = process.env.CLOUDFLARE_D1_DATABASE_ID?.trim();
-  const token = process.env.CLOUDFLARE_D1_TOKEN?.trim();
-  if (accountId && databaseId && token) return (shared = new SqlQuotaStore(d1Executor({ accountId, databaseId, token })));
-  if (process.env.NODE_ENV === "development") {
-    console.warn("[tinyagent-design] CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_D1_DATABASE_ID / CLOUDFLARE_D1_TOKEN are not set: " +
-      "prompt counts and grants are kept in memory for local development only. They reset when the dev server restarts.");
-    return (shared = new MemoryQuotaStore());
-  }
-  throw new StoreUnavailableError("Cloudflare D1 is not configured (CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_D1_DATABASE_ID, CLOUDFLARE_D1_TOKEN)");
-}
