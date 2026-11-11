@@ -1,0 +1,180 @@
+@import "tailwindcss";
+
+/* Black, white and greys. Light and dark follow the system setting. */
+@theme inline {
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --color-bg: var(--bg);
+  --color-fg: var(--fg);
+  --color-fg-2: var(--fg-2);
+  --color-fg-3: var(--fg-3);
+  --color-muted: var(--muted);
+  --color-pop: var(--pop);
+  --color-side: var(--side);
+  --color-side-hover: var(--side-hover);
+  --color-side-line: var(--side-line);
+  --color-hover: var(--hover);
+  --color-soft: var(--soft);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-ink: var(--ink);
+  --color-ink-fg: var(--ink-fg);
+  --color-bubble: var(--bubble);
+  --color-bubble-fg: var(--bubble-fg);
+  --color-bad: var(--bad);
+
+  --radius-xs: 0;
+  --radius-sm: 0;
+  --radius-md: 0;
+  --radius-lg: 0;
+  --radius-xl: 0;
+}
+
+:root {
+  color-scheme: light;
+  --sidebar-width: 240px;
+  --agent-width: 420px;
+  --bg: oklch(1 0 0);
+  --fg: oklch(0.145 0 0);
+  --fg-2: oklch(0.3 0 0);
+  --fg-3: oklch(0.58 0 0);
+  --muted: oklch(0.47 0 0);
+  --pop: oklch(1 0 0);
+  --side: oklch(0.985 0 0);
+  --side-hover: oklch(0.95 0 0);
+  --side-line: oklch(0.9 0 0);
+  --hover: oklch(0.965 0 0);
+  --soft: oklch(0.985 0 0);
+  --line: oklch(0.88 0 0);
+  --line-strong: oklch(0.72 0 0);
+  --input: oklch(0.89 0 0);
+  --ring: oklch(0.45 0 0);
+  --ink: oklch(0.145 0 0);
+  --ink-fg: oklch(0.985 0 0);
+  --bubble: oklch(0.965 0 0);
+  --bubble-fg: oklch(0.205 0 0);
+  --bad: oklch(0.45 0 0);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --bg: oklch(0.105 0 0);
+    --fg: oklch(0.98 0 0);
+    --fg-2: oklch(0.82 0 0);
+    --fg-3: oklch(0.48 0 0);
+    --muted: oklch(0.6 0 0);
+    --pop: oklch(0.165 0 0);
+    --side: oklch(0.08 0 0);
+    --side-hover: oklch(0.18 0 0);
+    --side-line: oklch(1 0 0 / 0.1);
+    --hover: oklch(0.21 0 0);
+    --soft: oklch(0.155 0 0);
+    --line: oklch(1 0 0 / 0.13);
+    --line-strong: oklch(1 0 0 / 0.26);
+    --input: oklch(1 0 0 / 0.12);
+    --ring: oklch(0.78 0 0);
+    --ink: oklch(0.965 0 0);
+    --ink-fg: oklch(0.145 0 0);
+    --bubble: oklch(0.235 0 0);
+    --bubble-fg: oklch(0.965 0 0);
+    --bad: oklch(0.75 0 0);
+  }
+}
+
+@layer base {
+  * {
+    border-color: var(--line);
+    outline-color: color-mix(in oklab, var(--ring) 50%, transparent);
+  }
+  button:not(:disabled),
+  [role="button"] {
+    cursor: pointer;
+  }
+}
+
+html,
+body {
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-mono);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  font-size: 14px;
+  text-rendering: optimizeLegibility;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+@media (pointer: coarse) {
+  input,
+  textarea {
+    font-size: 16px;
+  }
+}
+
+::selection {
+  background: color-mix(in oklab, var(--fg) 18%, transparent);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--hover) transparent;
+}
+
+@keyframes ta-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+@keyframes ta-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes ta-drawer-in {
+  from { transform: translateX(-10%); opacity: 0.6; }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .ta-pulse { animation: ta-pulse 1.4s ease-in-out infinite; }
+  .ta-pop[data-state="open"] { animation: ta-fade-in 150ms cubic-bezier(0.19, 1, 0.22, 1) both; }
+  .ta-drawer { animation: ta-drawer-in 150ms ease; }
+}
+
+/* The assistant's answers: small Markdown, the same quiet type as the rest. */
+.md {
+  max-width: 68ch;
+  overflow-wrap: anywhere;
+  font-size: 0.875rem;
+  line-height: 1.6;
+  text-wrap: pretty;
+}
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p { margin: 0 0 0.625rem; }
+.md h1, .md h2, .md h3, .md h4 { margin: 1rem 0 0.5rem; font-size: 0.875rem; font-weight: 600; }
+.md ul, .md ol { margin: 0 0 0.625rem; padding-inline-start: 1.25rem; }
+.md ul { list-style: disc; }
+.md ol { list-style: decimal; }
+.md li { margin: 0.1875rem 0; }
+.md li::marker { color: var(--muted); }
+.md code { border: 1px solid var(--line); background: var(--hover); padding: 0.0625rem 0.3125rem; font-size: 0.75rem; }
+.md pre { margin: 0.5rem 0 0.75rem; overflow-x: auto; border: 1px solid var(--line); background: var(--soft); padding: 0.75rem; }
+.md pre code { border: 0; background: transparent; padding: 0; }
+.md a { text-decoration: underline; text-underline-offset: 0.15em; }
+.md blockquote { margin: 0.5rem 0; border-inline-start: 1px solid var(--line-strong); padding-inline-start: 0.75rem; color: var(--fg-2); }
