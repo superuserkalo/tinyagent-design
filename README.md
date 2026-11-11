@@ -145,5 +145,4 @@ npm install
 ## License
 
 MIT, Copyright (c) 2026 Radian Labs. See [LICENSE](LICENSE) and
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The vendored TinyAgent SDK is MIT
 licensed (`vendor/tiny-agent-sdk/LICENSE`).
