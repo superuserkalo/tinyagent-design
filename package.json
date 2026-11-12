@@ -10,7 +10,8 @@
     "start": "next start",
     "typecheck": "next typegen && tsc --noEmit",
     "test": "node --test tests/*.test.ts",
-    "sync-sdk": "node scripts/sync-sdk.mjs"
+    "sync-sdk": "node scripts/sync-sdk.mjs",
+    "build-scene-assets": "node scripts/build-scene-assets.mjs"
   },
   "engines": {
     "node": ">=22.18"
@@ -35,7 +36,9 @@
     "@types/node": "26.6.6",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
+    "esbuild": "0.25.10",
     "tailwindcss": "4.3.5",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "vgpu": "0.6.0"
   }
 }

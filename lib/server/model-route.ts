@@ -15,7 +15,7 @@ import type { UserLookup } from "./hanko.ts";
 import { validateRequest } from "./request-shape.ts";
 import { json, sameOrigin } from "./origin.ts";
 import { ModelCalls, callId } from "./model-calls.ts";
-import { useGrant } from "./quota.ts";
+import { useGrant, checkGrant } from "./quota.ts";
 import { SESSION_ID } from "./sessions.ts";
 import type { QuotaStore, SqlExecutor } from "./store.ts";
 
@@ -93,7 +93,11 @@ export async function handleModelRequest(request: Request, deps: ModelRouteDeps)
     try {
       calls = new ModelCalls(await deps.calls(), deps.now);
       id = await callId(user.id, chatId, forwarded);
-      if (calls.replayable(await calls.get(id))) return new Response(calls.follow(id), { status: 200, headers: STREAM_HEADERS });
+      if (calls.replayable(await calls.get(id))) {
+        // Not counted again, but it still takes a live grant of this user's.
+        if (await checkGrant(await deps.store(), grantId, user.id) !== "ok") return fail(403, "grant_expired", "This prompt's grant has expired. Send a new prompt.");
+        return new Response(calls.follow(id), { status: 200, headers: STREAM_HEADERS });
+      }
     } catch {
       return fail(503, "storage_unavailable", "Chats are unavailable right now. Try again shortly.");
     }

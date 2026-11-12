@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sloshing Cube</title>
+<style>
+  :root { --bg: #07080a; --fg: #e9e6df; --muted: #8a8780; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); overflow: hidden; }
+  body { font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; cursor: grab; }
+  canvas:active { cursor: grabbing; }
+  .hud { position: fixed; left: 20px; bottom: 18px; pointer-events: none; }
+  .hud h1 { margin: 0; font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
+  .hud p { margin: 2px 0 0; color: var(--muted); }
+  .fallback { position: fixed; inset: 0; display: none; place-items: center; padding: 24px; text-align: center; color: var(--muted); }
+</style>
+</head>
+<body>
+<canvas id="c" aria-label="A glass cube full of particles. Drag to rotate it."></canvas>
+<div class="hud"><h1>Sloshing cube</h1><p>Drag to tip it. 32,768 particles, simulated on the GPU.</p></div>
+<div class="fallback" id="fallback">This scene needs WebGPU. Try a current Chrome, Edge or Safari.</div>
+<script>
+(async () => {
+  const { init, surface, compute, draw, storage, frameLoop, clock, prepareShader, scene } = vgpu;
+  const canvas = document.getElementById("c");
+  let gpu;
+  try { gpu = await init(); } catch { document.getElementById("fallback").style.display = "grid"; return; }
+
+  const COUNT = 32768, WG = 64;
+  const screen = surface(gpu, canvas, { dpr: [1, 2], depth: true, msaa: true, clearColor: [0.043, 0.043, 0.051, 1] });
+
+  // Palette "ember on ink": ground #0b0b0d, accent #f2683c, highlight #ffd2a1.
+  // Drawn first in the scene pass; depth off so the scene draws over it.
+  const background = draw(gpu, { label: "background", vertices: 3, cull: "none", depth: { write: false, compare: "always" }, shader: prepareShader(`
+    struct BgOut { @builtin(position) clip: vec4f, @location(0) uv: vec2f }
+    @vertex fn vs_main(@builtin(vertex_index) i: u32) -> BgOut {
+      let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u)) * 2.0 - 1.0;      // fullscreen triangle
+      return BgOut(vec4f(p, 0.0, 1.0), p * 0.5 + 0.5);                  // uv.y = 1 at the top
+    }
+    @fragment fn fs_main(in: BgOut) -> @location(0) vec4f {
+      let uv = in.uv;
+      let top = pow(vec3f(0.09, 0.08, 0.1), vec3f(2.2)); let bottom = pow(vec3f(0.043, 0.043, 0.051), vec3f(2.2)); // two shades of the ground colour
+      var c = mix(bottom, top, smoothstep(0.0, 1.0, uv.y));
+      let v = length((uv - vec2f(0.5, 0.55)) * vec2f(1.3, 1.0));
+      c *= 1.0 - 0.55 * smoothstep(0.35, 0.95, v);                       // vignette
+      c += (fract(sin(dot(uv * 913.0, vec2f(12.9898, 78.233))) * 43758.5453) - 0.5) * 0.012; // grain
+      return vec4f(pow(c, vec3f(1.0 / 2.2)), 1.0);
+    }
+  `) });
+
+  // State: position (xyz) + unused, velocity (xyz) + unused, in the cube's own frame.
+  const seed = new Float32Array(COUNT * 8);
+  for (let i = 0; i < COUNT; i++) {
+    seed[i * 8 + 0] = Math.random() * 1.6 - 0.8;
+    seed[i * 8 + 1] = Math.random() * 1.0 - 0.95;
+    seed[i * 8 + 2] = Math.random() * 1.6 - 0.8;
+  }
+  const particles = storage(gpu, seed.byteLength);
+  particles.write(seed);
+
+  // A density grid over the cube: each frame it is cleared, every particle adds 1 to its
+  // cell (atomics), and the step pushes particles down the density slope. That pressure is
+  // what makes 32k points behave like a liquid instead of collapsing into a corner.
+  const N = 24;
+  const grid = storage(gpu, N * N * N * 4);
+  const cell = `
+    const N: i32 = ${N};
+    fn cellOf(p: vec3f) -> vec3i { return clamp(vec3i(floor((p * 0.5 + 0.5) * f32(N))), vec3i(0), vec3i(N - 1)); }
+    fn idx(c: vec3i) -> u32 { let k = clamp(c, vec3i(0), vec3i(N - 1)); return u32(k.x + N * (k.y + N * k.z)); }
+  `;
+  const clear = compute(gpu, prepareShader(`
+    @group(0) @binding(0) var<storage, read_write> grid: array<u32>;
+    @compute @workgroup_size(${WG}) fn cs_main(@builtin(global_invocation_id) id: vec3u) {
+      if (id.x < arrayLength(&grid)) { grid[id.x] = 0u; }
+    }
+  `), { label: "clear", set: { grid } });
+  const scatter = compute(gpu, prepareShader(`
+    struct P { pos: vec4f, vel: vec4f }
+    @group(0) @binding(0) var<storage, read> ps: array<P>;
+    @group(0) @binding(1) var<storage, read_write> grid: array<atomic<u32>>;
+    ${cell}
+    @compute @workgroup_size(${WG}) fn cs_main(@builtin(global_invocation_id) id: vec3u) {
+      if (id.x >= arrayLength(&ps)) { return; }
+      atomicAdd(&grid[idx(cellOf(ps[id.x].pos.xyz))], 1u);
+    }
+  `), { label: "scatter", set: { ps: particles, grid } });
+
+  const step = compute(gpu, prepareShader(`
+    struct P { pos: vec4f, vel: vec4f }
+    struct Sim { gravity: vec4f, spin: vec4f, dt: f32, time: f32 }
+    @group(0) @binding(0) var<storage, read_write> ps: array<P>;
+    @group(0) @binding(1) var<storage, read> grid: array<u32>;
+    @group(0) @binding(2) var<uniform> sim: Sim;
+    ${cell}
+    fn d(c: vec3i) -> f32 { return f32(grid[idx(c)]); }
+    @compute @workgroup_size(${WG})
+    fn cs_main(@builtin(global_invocation_id) id: vec3u) {
+      let i = id.x;
+      if (i >= arrayLength(&ps)) { return; }
+      var p = ps[i];
+      let c = cellOf(p.pos.xyz);
+      // Pressure: move from crowded cells toward empty ones.
+      let grad = vec3f(d(c + vec3i(1,0,0)) - d(c - vec3i(1,0,0)),
+                       d(c + vec3i(0,1,0)) - d(c - vec3i(0,1,0)),
+                       d(c + vec3i(0,0,1)) - d(c - vec3i(0,0,1)));
+      var a = sim.gravity.xyz - grad * 1.6 + cross(sim.spin.xyz, p.pos.xyz) * 2.0;
+      let jitter = fract(sin(vec3f(f32(i), f32(i) * 1.7, f32(i) * 2.3) + sim.time) * 43758.5453) - 0.5;
+      a += jitter * 1.5;
+      var v = (p.vel.xyz + a * sim.dt) * 0.985;
+      var x = p.pos.xyz + v * sim.dt;
+      let wall = 0.95;
+      for (var k = 0; k < 3; k++) {
+        if (x[k] > wall) { x[k] = wall; v[k] = -abs(v[k]) * 0.3; }
+        if (x[k] < -wall) { x[k] = -wall; v[k] = abs(v[k]) * 0.3; }
+      }
+      ps[i] = P(vec4f(x, 1.0), vec4f(v, 0.0));
+    }
+  `), { label: "step", set: { ps: particles, grid } });
+
+  const look = `
+    struct Camera { viewProjection: mat4x4f, model: mat4x4f, eye: vec4f }
+    @group(0) @binding(1) var<uniform> camera: Camera;
+  `;
+  // Particles: one camera-facing quad per instance, shaded as a lit sphere.
+  const dots = draw(gpu, {
+    label: "dots", vertices: 6, instances: COUNT, cull: "none",
+    shader: prepareShader(`
+      struct P { pos: vec4f, vel: vec4f }
+      @group(0) @binding(0) var<storage, read> ps: array<P>;
+      ${look}
+      struct Out { @builtin(position) clip: vec4f, @location(0) uv: vec2f, @location(1) speed: f32 }
+      @vertex fn vs_main(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> Out {
+        var c = array<vec2f, 6>(vec2f(-1,-1), vec2f(1,-1), vec2f(1,1), vec2f(-1,-1), vec2f(1,1), vec2f(-1,1));
+        let world = camera.model * vec4f(ps[i].pos.xyz, 1.0);
+        var o: Out;
+        o.clip = camera.viewProjection * world;
+        o.clip = vec4f(o.clip.xy + c[v] * 0.018 * vec2f(1.0 / camera.eye.w, 1.0), o.clip.zw);
+        o.uv = c[v];
+        o.speed = length(ps[i].vel.xyz);
+        return o;
+      }
+      fn aces(x: vec3f) -> vec3f { return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), vec3f(0.0), vec3f(1.0)); }
+      @fragment fn fs_main(i: Out) -> @location(0) vec4f {
+        let r2 = dot(i.uv, i.uv);
+        if (r2 > 1.0) { discard; }
+        // Each dot is a tiny lit sphere: key light, sky ambient, specular, rim.
+        let n = vec3f(i.uv, sqrt(1.0 - r2));
+        let l = normalize(vec3f(-0.5, 0.8, 0.45));
+        let h = normalize(l + vec3f(0.0, 0.0, 1.0));
+        let accent = pow(vec3f(0.949, 0.408, 0.235), vec3f(2.2));
+        let highlight = pow(vec3f(1.0, 0.824, 0.631), vec3f(2.2));
+        let albedo = mix(accent, highlight, clamp(i.speed * 0.5, 0.0, 1.0));
+        let sky = mix(vec3f(0.03, 0.03, 0.04), vec3f(0.22, 0.24, 0.3), n.y * 0.5 + 0.5);
+        let rim = pow(1.0 - n.z, 4.0) * 0.6;
+        var c = albedo * (max(dot(n, l), 0.0) * 1.6 + sky) + pow(max(dot(n, h), 0.0), 48.0) * 0.5 + rim * albedo;
+        return vec4f(pow(aces(c), vec3f(1.0 / 2.2)), 1.0);
+      }
+    `),
+    set: { ps: particles },
+  });
+
+  // The glass: the 12 edges of the cube as thin lines (line-list from vertex_index).
+  const edges = draw(gpu, {
+    label: "edges", vertices: 24, cull: "none", blend: "additive", depth: { write: false },
+    shader: prepareShader(`
+      ${look}
+      @vertex fn vs_main(@builtin(vertex_index) v: u32) -> @builtin(position) vec4f {
+        var e = array<vec3f, 24>(
+          vec3f(-1,-1,-1), vec3f(1,-1,-1), vec3f(1,-1,-1), vec3f(1,1,-1), vec3f(1,1,-1), vec3f(-1,1,-1), vec3f(-1,1,-1), vec3f(-1,-1,-1),
+          vec3f(-1,-1,1), vec3f(1,-1,1), vec3f(1,-1,1), vec3f(1,1,1), vec3f(1,1,1), vec3f(-1,1,1), vec3f(-1,1,1), vec3f(-1,-1,1),
+          vec3f(-1,-1,-1), vec3f(-1,-1,1), vec3f(1,-1,-1), vec3f(1,-1,1), vec3f(1,1,-1), vec3f(1,1,1), vec3f(-1,1,-1), vec3f(-1,1,1));
+        return camera.viewProjection * camera.model * vec4f(e[v], 1.0);
+      }
+      @fragment fn fs_main() -> @location(0) vec4f { return vec4f(0.42, 0.38, 0.36, 1.0); }
+    `),
+    geometry: { vertexCount: 24, topology: "line-list" },
+  });
+
+  // Camera and the cube's rotation, which the pointer drives with a little inertia.
+  const { perspective, viewMatrices, orbitRig, rigPose, composeMatrix } = scene;
+  const projection = new Float32Array(16);
+  const pose = { position: new Float32Array(3), quaternion: new Float32Array(4) };
+  const view = { view: new Float32Array(16), viewProjection: new Float32Array(16) };
+  const model = new Float32Array(16);
+  let yaw = 0.6, pitch = 0.35, vy = 0, vp = 0, aspect = 1;
+  const resize = () => {
+    aspect = canvas.clientWidth / Math.max(1, canvas.clientHeight);
+    perspective({ fov: 40, near: 0.1, far: 50 }, aspect, projection);
+    // Back the camera off on narrow screens so the whole cube stays in view.
+    rigPose(orbitRig({ yaw: 0, pitch: 0.25, distance: 6.5 / Math.min(1, aspect * 1.1) }), pose);
+  };
+  resize(); screen.onResize(resize);
+
+  let dragging = false, lx = 0, ly = 0;
+  canvas.addEventListener("pointerdown", (e) => { dragging = true; lx = e.clientX; ly = e.clientY; canvas.setPointerCapture(e.pointerId); });
+  canvas.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    vy = (e.clientX - lx) * 0.01; vp = (e.clientY - ly) * 0.01; lx = e.clientX; ly = e.clientY;
+  });
+  const release = () => { dragging = false; };
+  canvas.addEventListener("pointerup", release);
+  canvas.addEventListener("pointercancel", release);
+
+  const quat = (x, y) => { // yaw about Y then pitch about X
+    const cy = Math.cos(y / 2), sy = Math.sin(y / 2), cx = Math.cos(x / 2), sx = Math.sin(x / 2);
+    return [sx * cy, cx * sy, -sx * sy, cx * cy];
+  };
+  const toLocal = (q, v) => { // rotate v by the inverse of q
+    const [x, y, z, w] = [-q[0], -q[1], -q[2], q[3]];
+    const tx = 2 * (y * v[2] - z * v[1]), ty = 2 * (z * v[0] - x * v[2]), tz = 2 * (x * v[1] - y * v[0]);
+    return [v[0] + w * tx + (y * tz - z * ty), v[1] + w * ty + (z * tx - x * tz), v[2] + w * tz + (x * ty - y * tx)];
+  };
+
+  const time = clock(gpu);
+  frameLoop(gpu, (frame) => {
+    const dt = Math.min(time.deltaTime, 1 / 30);
+    // Released: the spin decays into a slow idle turn, so the scene never stands still.
+    if (!dragging) { vy = vy * 0.94 + 0.0015 * 0.06; vp *= 0.94; }
+    yaw += vy; pitch = Math.max(-1.4, Math.min(1.4, pitch + vp));
+    const q = quat(pitch, yaw);
+    composeMatrix({ quaternion: q, scale: 1 }, model);
+    viewMatrices(pose, projection, view);
+    const g = toLocal(q, [0, -9.8, 0]);
+    const spin = toLocal(q, [vp * 6, vy * 6, 0]);
+    const cam = { viewProjection: view.viewProjection, model, eye: [0, 0, 0, aspect] };
+    step.set({ sim: { gravity: [...g, 0], spin: [...spin, 0], dt, time: time.time } });
+    dots.set({ camera: cam });
+    edges.set({ camera: cam });
+    frame.computePass((pass) => {
+      pass.dispatch(clear, Math.ceil(N * N * N / WG));
+      pass.dispatch(scatter, Math.ceil(COUNT / WG));
+      pass.dispatch(step, Math.ceil(COUNT / WG));
+    });
+    frame.pass(screen, (pass) => { pass.draw(background); pass.draw(dots); pass.draw(edges); });
+  });
+})();
+</script>
+</body>
+</html>

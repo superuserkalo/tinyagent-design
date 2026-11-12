@@ -8,9 +8,9 @@ import { ArrowRight, Check, ChevronCircle, Copy, Pencil, Pulse } from "./icons";
 import { cn, Dialog, DialogContent, DialogTitle } from "./ui";
 
 export const SUGGESTIONS = [
-  "Design a Radian starship drifting over Earth — drag it and it swings back on spring physics",
-  "Create a launch page for a European cloud",
-  "Design a mission control dashboard",
+  "A glass cube full of liquid metal that sloshes when I drag it around",
+  "A silk cloth hanging from two pins that I can grab and tear",
+  "A galaxy of 200,000 stars that swirls toward my cursor",
 ];
 
 export function formatDuration(ms: number): string {

@@ -29,13 +29,14 @@ export function modelLabel(model = gatewayModel()): string {
 }
 
 /**
- * How hard the model thinks (env AI_GATEWAY_REASONING_EFFORT, default "max": Artificial
- * Analysis rates Claude Haiku 5.5 highest at max). Claude models are also asked for a
- * summary of their thinking, which the server saves and never shows.
+ * How hard the model thinks (env AI_GATEWAY_REASONING_EFFORT, default "medium"). On this
+ * task Claude Haiku 5.5 at max spent all 128k output tokens thinking and wrote nothing, and
+ * at high one scene took 236 s (47k thinking tokens), too close to the 300 s function limit. Claude models are also asked for a summary of their thinking,
+ * which the server saves and never shows.
  */
 export function reasoningEffort(): string {
   const value = process.env.AI_GATEWAY_REASONING_EFFORT?.trim();
-  return value && /^(low|medium|high|xhigh|max)$/.test(value) ? value : "max";
+  return value && /^(low|medium|high|xhigh|max)$/.test(value) ? value : "medium";
 }
 
 /** The reasoning fields of a gateway request for this model. */

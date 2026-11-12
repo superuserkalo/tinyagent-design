@@ -52,12 +52,6 @@ const BODY = (
   </>
 );
 
-const CREDIT = (
-  <p className="mt-6 text-xs leading-5 text-fg-3">
-    Inspired by <External href="https://github.com/vercel-labs/fx0">fx0 (vercel-labs/fx0)</External>.
-  </p>
-);
-
 /** What the preview shows before there is a design. */
 export function HowItWorksPanel() {
   const [expanded, setExpanded] = useState(false);
@@ -68,8 +62,8 @@ export function HowItWorksPanel() {
       <p className="mt-2">
         TinyAgent is an <External href={SDK_URL}>open-source agent SDK</External> built to showcase durable agents that run anywhere.
       </p>
-      <p className="mt-2">Describe a page in the chat and it shows up here as one HTML file.</p>
-      <div id={bodyId} hidden={!expanded}>{BODY}{CREDIT}</div>
+      <p className="mt-2">Describe a 3D scene in the chat and it runs here on WebGPU, as one HTML file.</p>
+      <div id={bodyId} hidden={!expanded}>{BODY}</div>
       <div className="mt-6 flex items-center justify-between gap-4">
         <button
           type="button"
@@ -115,7 +109,6 @@ export default function HowItWorks() {
             can read in an afternoon. Its browser entry gives you the agent loop, streaming, tool calls and durable sessions.
           </DialogDescription>
           {BODY}
-          {CREDIT}
           <a href={REPO_URL} target="_blank" rel="noopener noreferrer" className={`${button.primary} mt-6`}>
             fork tinyagent-design
           </a>

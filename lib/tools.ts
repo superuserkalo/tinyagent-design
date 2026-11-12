@@ -1,5 +1,5 @@
-// The agent's one tool. It runs in the browser: the handler stores the page in
-// IndexedDB and the preview shows it. Nothing here touches the network.
+// The agent's one tool. It runs in the browser: the handler saves the scene, the preview
+// shows it, and a test run's errors (if any) go back to the model so it can fix them.
 import { Tool, ToolError } from "tiny-agent-sdk/browser";
 
 export const PUBLISH_DESIGN = "publish_design";
@@ -17,7 +17,13 @@ export interface PublishedDesign {
   html: string;
 }
 
-export function publishDesignTool(save: (design: PublishedDesign, signal: AbortSignal) => Promise<number>): Tool {
+/** What a short test run of a published scene found. */
+export type RunReport = { ran: true; errors: string[] } | { ran: false; reason: string };
+
+export function publishDesignTool(
+  save: (design: PublishedDesign, signal: AbortSignal) => Promise<number>,
+  run?: (html: string, signal: AbortSignal) => Promise<RunReport>,
+): Tool {
   return new Tool({
     name: PUBLISH_DESIGN,
     description:
@@ -39,7 +45,7 @@ export function publishDesignTool(save: (design: PublishedDesign, signal: AbortS
     // Safe to repeat: the design is stored under the call's executionId, so running it
     // again after an interrupted run writes the same row.
     idempotent: true,
-    timeoutSeconds: 30,
+    timeoutSeconds: 45,
     handler: async ({ title, html }, signal, { executionId }) => {
       const page = String(html).trim();
       const name = String(title).trim();
@@ -48,7 +54,13 @@ export function publishDesignTool(save: (design: PublishedDesign, signal: AbortS
       if (new TextEncoder().encode(page).length > MAX_DESIGN_BYTES)
         throw new ToolError(`The document is over ${MAX_DESIGN_BYTES / 1000} KB. Make it more compact and publish again.`);
       const version = await save({ executionId, title: name, html: page }, signal);
-      return `Published version ${version}: ${name}. The preview is showing it.`;
+      const published = `Published version ${version}: ${name}. The preview is showing it.`;
+      if (!run) return published;
+      const report = await run(page, signal);
+      if (!report.ran) return `${published} It could not be test-run here (${report.reason}).`;
+      if (!report.errors.length) return `${published} It ran for 3 seconds without errors.`;
+      return `${published} But it failed when it ran:\n${report.errors.map((error, index) => `${index + 1}. ${error}`).join("\n")}\n` +
+        "Fix exactly these problems and publish the complete document again.";
     },
   });
 }

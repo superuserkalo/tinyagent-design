@@ -226,3 +226,18 @@ test("a stream that breaks off is saved as failed; repeating the request starts 
   upstreams[1].end();
   assert.equal((await read(again)).text, "Whole");
 });
+
+test("a replay still needs a live grant of the user's own, though it is not counted", async () => {
+  const { deps, store, upstreams, work } = setup();
+  const grant = await grantFor(store);
+  const first = await handleModelRequest(request(grant), deps);
+  upstreams[0].say("Hello");
+  upstreams[0].end();
+  await read(first);
+  await Promise.all(work);
+
+  const forged = await handleModelRequest(request("g_" + "A".repeat(32)), deps);
+  assert.equal(forged.status, 403);
+  assert.equal(upstreams.length, 1);
+  assert.equal((await read(await handleModelRequest(request(grant), deps))).text, "Hello");
+});

@@ -112,6 +112,19 @@ function fileName(title: string): string {
   return `${slug || "design"}.html`;
 }
 
+/** The design as a file that runs on its own: vgpu inlined ahead of the design's scripts. */
+let vgpuScript: Promise<string> | null = null;
+async function standalone(html: string): Promise<string> {
+  if (!/\bvgpu\b/.test(html)) return html;
+  vgpuScript ??= fetch("/vgpu.js").then((response) => {
+    if (!response.ok) throw new Error("vgpu.js");
+    return response.text();
+  }).catch((error) => { vgpuScript = null; throw error; });
+  const tag = `<script>${await vgpuScript}</script>`;
+  const head = /<head[^>]*>/i.exec(html);
+  return head ? html.slice(0, head.index + head[0].length) + tag + html.slice(head.index + head[0].length) : tag + html;
+}
+
 /** Copy or download the design on screen. */
 export function ExportMenu({ design, load, onNotice }: { design: DesignMeta; load: (id: string) => Promise<string>; onNotice: (text: string) => void }) {
   const [open, setOpen] = useState(false);
@@ -120,7 +133,7 @@ export function ExportMenu({ design, load, onNotice }: { design: DesignMeta; loa
     setOpen(false);
     try {
       // Safari allows a clipboard write only inside the click: hand it the pending text.
-      const text = load(design.id);
+      const text = load(design.id).then(standalone);
       if (typeof ClipboardItem !== "undefined" && navigator.clipboard?.write)
         await navigator.clipboard.write([new ClipboardItem({ "text/plain": text.then((value) => new Blob([value], { type: "text/plain" })) })]);
       else await navigator.clipboard.writeText(await text);
@@ -133,7 +146,7 @@ export function ExportMenu({ design, load, onNotice }: { design: DesignMeta; loa
   async function download() {
     setOpen(false);
     let html: string;
-    try { html = await load(design.id); } catch { return onNotice("Unable to download the design. Try again."); }
+    try { html = await standalone(await load(design.id)); } catch { return onNotice("Unable to download the design. Try again."); }
     // Octet-stream, so the browser saves it and never renders it on this origin.
     const url = URL.createObjectURL(new Blob([html], { type: "application/octet-stream" }));
     const link = document.createElement("a");

@@ -183,7 +183,7 @@ const Composer = forwardRef<ComposerHandle, {
           autoComplete="off"
           value={value}
           disabled={locked}
-          placeholder={locked ? "running on another device…" : "ask TinyAgent to design"}
+          placeholder={locked ? "running on another device…" : "ask TinyAgent for a 3D scene"}
           onChange={(event) => setValue(event.target.value)}
           onPaste={(event) => {
             const files = Array.from(event.clipboardData?.files ?? []).filter((file) => file.type.startsWith("image/"));

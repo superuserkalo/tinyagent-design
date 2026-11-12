@@ -7,7 +7,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "TinyAgent Design",
-  description: "Describe a page and an agent builds it as one HTML file, live. The agent loop runs in your browser on the TinyAgent SDK.",
+  description: "Describe a 3D scene and an agent builds it on WebGPU as one HTML file, live. The agent loop runs in your browser on the TinyAgent SDK.",
   icons: { icon: "/icon.svg" },
 };
 

@@ -12,6 +12,8 @@ export interface QuotaStore {
   consume(userId: string, initial: number, grantId: string, ttlSeconds: number, maxRequests: number): Promise<number | null>;
   /** Count one model request against a grant. */
   useGrant(grantId: string, userId: string): Promise<GrantUse>;
+  /** Whether a grant is live and the user's, without counting a request. */
+  checkGrant(grantId: string, userId: string): Promise<"ok" | "missing" | "wrong_user">;
   /** Fixed-window rate limit. True when this hit is allowed. */
   hit(key: string, limit: number, windowSeconds: number): Promise<boolean>;
 }
@@ -79,6 +81,13 @@ export class SqlQuotaStore implements QuotaStore {
     if (!grant || Number(grant.expires_at) <= now) return "missing";
     if (grant.user_id !== userId) return "wrong_user";
     return "exhausted";
+  }
+
+  async checkGrant(grantId: string, userId: string): Promise<"ok" | "missing" | "wrong_user"> {
+    const [rows] = await this.exec([{ sql: SQL.grant, params: [grantId] }]);
+    const grant = rows[0];
+    if (!grant || Number(grant.expires_at) <= this.now()) return "missing";
+    return grant.user_id === userId ? "ok" : "wrong_user";
   }
 
   async hit(key: string, limit: number, windowSeconds: number): Promise<boolean> {
@@ -154,6 +163,12 @@ export class MemoryQuotaStore implements QuotaStore {
     if (grant.requests >= grant.max) return "exhausted";
     grant.requests += 1;
     return "ok";
+  }
+
+  async checkGrant(grantId: string, userId: string): Promise<"ok" | "missing" | "wrong_user"> {
+    const grant = this.grants.get(grantId);
+    if (!grant || grant.expiresAt <= this.now()) return "missing";
+    return grant.user === userId ? "ok" : "wrong_user";
   }
 
   async hit(key: string, limit: number, windowSeconds: number): Promise<boolean> {

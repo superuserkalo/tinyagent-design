@@ -35,3 +35,9 @@ export async function useGrant(store: QuotaStore, grantId: string, userId: strin
   if (!/^g_[A-Za-z0-9_-]{32}$/.test(grantId)) return "missing";
   return store.useGrant(grantId, userId);
 }
+
+/** A live grant of this user's, not counted: a replay of a call already paid for. */
+export async function checkGrant(store: QuotaStore, grantId: string, userId: string): Promise<"ok" | "missing" | "wrong_user"> {
+  if (!/^g_[A-Za-z0-9_-]{32}$/.test(grantId)) return "missing";
+  return store.checkGrant(grantId, userId);
+}

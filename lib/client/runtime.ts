@@ -16,6 +16,7 @@ import {
 import { createDesignAgent } from "../agent.ts";
 import { compactRequest } from "../request-budget.ts";
 import { publishDesignTool } from "../tools.ts";
+import { checkScene } from "./check-scene.ts";
 import { api, apiHeaders, errorMessage } from "./api.ts";
 import { partialJsonString, watchToolArguments } from "./draft.ts";
 import type { AttachedImage } from "./images.ts";
@@ -252,7 +253,7 @@ export class DesignRuntime {
       }
       const designs = await this.loadDesigns(sessionId);
       return designs.findIndex((row) => row.id === design.executionId) + 1;
-    });
+    }, this.options.scripted ? undefined : (html, signal) => checkScene(html, signal));
     return createDesignAgent({ model: MODEL, provider: this.providerFor(sessionId), tools: [tool] });
   }
 
@@ -263,6 +264,9 @@ export class DesignRuntime {
     return new ChatCompletionsProvider({
       baseUrl: `${window.location.origin}/api/model/v1`,
       apiKey: "", // No key in the page: the server holds the gateway credential.
+      // The model thinks before it writes, and its thinking never reaches the page, so a
+      // request can be silent for minutes. Just under the server function's 300 s limit.
+      timeoutMs: 290_000,
       fetch: async (input, init) => {
         const headers = apiHeaders(init?.headers);
         const grant = this.grants.get(sessionId);
