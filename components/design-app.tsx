@@ -74,8 +74,9 @@ export default function DesignApp({ model: initialModel, freePrompts: initialFre
     const params = new URLSearchParams(window.location.search);
     const isScripted = devTools && params.get("scripted") === "1";
     setScripted(isScripted);
-    // Development only: scripted runs act as a named local user (?as=name), no sign-in.
-    if (isScripted) setDevUser(/^[a-z0-9-]{1,32}$/.test(params.get("as") ?? "") ? params.get("as") : "dev");
+    // Development only: act as a named local user (?as=name), no sign-in. Scripted runs default to "dev".
+    const devName = params.get("as");
+    if (devTools && (isScripted || devName)) setDevUser(devName && /^[a-z0-9-]{1,32}$/.test(devName) ? devName : "dev");
     setCollapsed(document.documentElement.classList.contains("sidebar-collapsed"));
     // One per page: React's development double-run of effects must not open a second
     // runtime, which would resume the same interrupted run twice.
