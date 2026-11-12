@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { DesignMeta } from "@/lib/client/runtime";
+import { PREVIEW_FRAME } from "@/lib/preview-frame";
 import { HowItWorksPanel } from "./how-it-works";
 import { Copy, Download, Share, Check } from "./icons";
 import { button, Popover, PopoverContent, PopoverTrigger, Tip } from "./ui";
@@ -26,7 +27,7 @@ function DesignFrame({ design, html }: { design: DesignMeta; html: string }) {
   return (
     <iframe
       ref={frame}
-      src="/preview-frame"
+      src={PREVIEW_FRAME}
       sandbox="allow-scripts"
       referrerPolicy="no-referrer"
       title={`Design preview: ${design.title}`}

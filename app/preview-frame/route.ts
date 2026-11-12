@@ -3,9 +3,9 @@
 // cookies, IndexedDB or DOM. It asks its parent for the HTML once, writes it, and from
 // then on is the design. Its own CSP replaces the app's: inline scripts and styles
 // run, nothing loads from the network except Google Fonts.
-// Ahead of the design's own scripts it puts vgpu (WebGPU, the global `vgpu`) and an error
-// reporter that posts uncaught errors, with any WGSL compiler messages, to the parent, which
-// hands them to the agent after a publish.
+// Ahead of the design's own scripts it puts vgpu (WebGPU, the global `vgpu`) and a reporter
+// that posts uncaught errors (with any WGSL compiler messages) and, when asked, a screenshot
+// to the parent, which hands them to the agent after a publish.
 import { VGPU_SCRIPT } from "@/lib/vgpu-bundle";
 
 export const dynamic = "force-static";
@@ -37,6 +37,41 @@ const REPORTER = `(function () {
     if (x.cause && x.cause.message) text += "\\n" + x.cause.message;
     return text;
   }
+  // On request from the parent (the post-publish check), grab the largest canvas right
+  // after the scene draws a frame (a WebGPU canvas can be read only in the same task it was
+  // drawn in), shrink it, and post it back as a JPEG with how much the picture varies.
+  var raf = window.requestAnimationFrame.bind(window), want = false;
+  window.requestAnimationFrame = function (callback) {
+    return raf(function (time) { callback(time); if (want) { want = false; shoot(); } });
+  };
+  function shoot() {
+    var canvas = null, area = 0;
+    Array.prototype.forEach.call(document.querySelectorAll("canvas"), function (c) {
+      if (c.width * c.height > area) { area = c.width * c.height; canvas = c; }
+    });
+    var shot = { type: "tinyagent-design-shot", image: null, spread: null };
+    try {
+      if (canvas) {
+        var scale = Math.min(1, 720 / Math.max(canvas.width, canvas.height));
+        var out = document.createElement("canvas");
+        out.width = Math.max(1, Math.round(canvas.width * scale));
+        out.height = Math.max(1, Math.round(canvas.height * scale));
+        var ctx = out.getContext("2d");
+        ctx.drawImage(canvas, 0, 0, out.width, out.height);
+        var px = ctx.getImageData(0, 0, out.width, out.height).data, sum = 0, sq = 0, n = 0;
+        for (var i = 0; i < px.length; i += 16) { var y = 0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2]; sum += y; sq += y * y; n++; }
+        var mean = sum / n;
+        shot.spread = Math.sqrt(Math.max(0, sq / n - mean * mean));
+        shot.image = out.toDataURL("image/jpeg", 0.72);
+      }
+    } catch (e) {}
+    try { parent.postMessage(shot, "*"); } catch (e) {}
+  }
+  addEventListener("message", function (event) {
+    if (event.source !== parent || !event.data || event.data.type !== "tinyagent-design-capture") return;
+    want = true;
+    setTimeout(function () { if (want) { want = false; shoot(); } }, 500); // a scene that does not animate
+  });
   addEventListener("error", function (event) { send(describe(event.error || { message: event.message })); });
   addEventListener("unhandledrejection", function (event) { send(describe(event.reason)); });
   var original = console.error;

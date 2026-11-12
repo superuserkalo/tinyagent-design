@@ -2,6 +2,7 @@
 // throws: WGSL compile errors, vgpu binding errors, exceptions. The agent gets them back
 // as the tool's result and fixes the scene. The frame is the same sandboxed /preview-frame
 // the preview uses, so the check sees exactly what a visitor would.
+import { PREVIEW_FRAME } from "../preview-frame.ts";
 
 /** How long a scene runs before it counts as working. Shaders compile on the first frames. */
 const RUN_MS = 3000;
@@ -9,20 +10,26 @@ const RUN_MS = 3000;
 const LOAD_MS = 8000;
 
 export type SceneCheck =
-  | { ran: true; errors: string[] }
+  | { ran: true; errors: string[]; shot: Shot | null }
   | { ran: false; reason: string };
+
+/** The scene's largest canvas a few seconds in: a JPEG data URL and the spread of its brightness (0 to 255). */
+export interface Shot { image: string | null; spread: number | null }
+
+/** Longest wait for the screenshot once it is asked for. */
+const SHOT_MS = 1500;
 
 export function checkScene(html: string, signal?: AbortSignal): Promise<SceneCheck> {
   if (typeof navigator === "undefined" || !("gpu" in navigator))
     return Promise.resolve({ ran: false, reason: "this browser has no WebGPU" });
   return new Promise((resolve) => {
     const frame = document.createElement("iframe");
-    frame.src = "/preview-frame";
+    frame.src = PREVIEW_FRAME;
     frame.setAttribute("sandbox", "allow-scripts");
     frame.setAttribute("aria-hidden", "true");
     frame.tabIndex = -1;
     // In the viewport (browsers pause hidden and offscreen frames) but invisible and inert.
-    frame.style.cssText = "position:fixed;right:0;bottom:0;width:480px;height:320px;opacity:0;pointer-events:none;border:0;z-index:-1";
+    frame.style.cssText = "position:fixed;right:0;bottom:0;width:960px;height:600px;opacity:0;pointer-events:none;border:0;z-index:-1";
     const errors: string[] = [];
     let timer = setTimeout(() => finish({ ran: false, reason: "the scene did not load" }), LOAD_MS);
     const onMessage = (event: MessageEvent) => {
@@ -30,7 +37,14 @@ export function checkScene(html: string, signal?: AbortSignal): Promise<SceneChe
       if (event.data?.type === "tinyagent-design-ready") {
         frame.contentWindow!.postMessage({ type: "tinyagent-design", html }, "*");
         clearTimeout(timer);
-        timer = setTimeout(() => finish({ ran: true, errors }), RUN_MS);
+        timer = setTimeout(() => {
+          frame.contentWindow?.postMessage({ type: "tinyagent-design-capture" }, "*");
+          timer = setTimeout(() => finish({ ran: true, errors, shot: null }), SHOT_MS);
+        }, RUN_MS);
+      } else if (event.data?.type === "tinyagent-design-shot") {
+        const image = typeof event.data.image === "string" && event.data.image.startsWith("data:image/jpeg;base64,") ? event.data.image : null;
+        const spread = typeof event.data.spread === "number" && Number.isFinite(event.data.spread) ? event.data.spread : null;
+        finish({ ran: true, errors, shot: { image, spread } });
       } else if (event.data?.type === "tinyagent-design-error" && typeof event.data.message === "string") {
         if (!errors.includes(event.data.message)) errors.push(event.data.message);
       }

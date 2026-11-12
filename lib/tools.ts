@@ -18,7 +18,12 @@ export interface PublishedDesign {
 }
 
 /** What a short test run of a published scene found. */
-export type RunReport = { ran: true; errors: string[] } | { ran: false; reason: string };
+export type RunReport =
+  | { ran: true; errors: string[]; shot: { image: string | null; spread: number | null } | null }
+  | { ran: false; reason: string };
+
+/** Below this spread of brightness (0 to 255) a picture is one flat colour: nothing is drawn. */
+const BLANK_SPREAD = 2;
 
 export function publishDesignTool(
   save: (design: PublishedDesign, signal: AbortSignal) => Promise<number>,
@@ -58,9 +63,20 @@ export function publishDesignTool(
       if (!run) return published;
       const report = await run(page, signal);
       if (!report.ran) return `${published} It could not be test-run here (${report.reason}).`;
-      if (!report.errors.length) return `${published} It ran for 3 seconds without errors.`;
-      return `${published} But it failed when it ran:\n${report.errors.map((error, index) => `${index + 1}. ${error}`).join("\n")}\n` +
-        "Fix exactly these problems and publish the complete document again.";
+      if (report.errors.length)
+        return `${published} But it failed when it ran:\n${report.errors.map((error, index) => `${index + 1}. ${error}`).join("\n")}\n` +
+          "Fix exactly these problems and publish the complete document again.";
+      const shot = report.shot;
+      if (!shot?.image) return `${published} It ran for 3 seconds without errors (no screenshot was available).`;
+      const blank = shot.spread !== null && shot.spread < BLANK_SPREAD;
+      const words = blank
+        ? `${published} It ran without errors, but the canvas is one flat colour after 3 seconds: nothing visible is drawn. ` +
+          "Find why (camera, scale, positions, depth, blending, alpha) and publish again."
+        : `${published} It ran for 3 seconds without errors. This is the canvas at that moment. ` +
+          "Judge it as a visitor would: is the hero clearly visible and filling the frame, is it lit and coloured as intended, " +
+          "does it look like the scene you meant? If not, fix what is wrong and publish again; if it does, reply to the user.";
+      const [, data] = shot.image.split(",", 2);
+      return [{ type: "text", text: words }, { type: "image", mediaType: "image/jpeg", data }];
     },
   });
 }
