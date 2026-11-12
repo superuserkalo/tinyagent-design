@@ -23,6 +23,8 @@ import { scriptedProvider } from "./scripted.ts";
 import { ServerStorage } from "./server-storage.ts";
 
 const GRANT_HEADER = "x-tinyagent-grant";
+/** Lets the server find a model call this chat already started, to replay it after a reload. */
+const CHAT_HEADER = "x-tinyagent-chat";
 /** The server picks the real model; the journal records this name. */
 const MODEL = "gateway";
 const HEARTBEAT_MS = 7_000;
@@ -265,6 +267,7 @@ export class DesignRuntime {
         const headers = apiHeaders(init?.headers);
         const grant = this.grants.get(sessionId);
         if (grant) headers.set(GRANT_HEADER, grant);
+        headers.set(CHAT_HEADER, sessionId);
         // Older pages and images are dropped from the request; the journal keeps them.
         let body = init?.body;
         if (typeof body === "string") {
@@ -620,11 +623,19 @@ export class DesignRuntime {
   }
 
   stop(): void {
-    this.live.get(this.state.active.id)?.controller?.abort();
+    const id = this.state.active.id;
+    this.live.get(id)?.controller?.abort();
+    // The model call runs on the server until told otherwise; closing the tab does not stop it.
+    this.stopOnServer(id);
+  }
+
+  private stopOnServer(id: string) {
+    if (!this.options.scripted) void api(`/api/chats/${encodeURIComponent(id)}/stop`, { method: "POST", body: {} }).catch(() => {});
   }
 
   async hide(id: string): Promise<void> {
     this.live.get(id)?.controller?.abort();
+    this.stopOnServer(id);
     await api(`/api/chats/${encodeURIComponent(id)}`, { method: "PATCH", body: { hidden: true } }).catch(() => {});
     if (this.state.active.id === id) this.newDesign();
     await this.refreshChats().catch(() => {});
