@@ -41,9 +41,9 @@ function QuotaPill({ quota, model, onSignIn }: { quota: Quota; model: string; on
             className="w-auto px-2 py-1 text-xs leading-5 shadow-md">
             Runs {model}.{" "}
             <button type="button" onClick={() => { setOpen(false); onSignIn(); }} className="text-fg underline underline-offset-2 outline-none hover:no-underline focus-visible:ring-2 focus-visible:ring-ring">
-              Sign in
+              Sign in or create
             </button>{" "}
-            with your Radian account.
+            a Radian account.
           </PopoverContent>
         </Popover>
       ) : left > 0 ? (

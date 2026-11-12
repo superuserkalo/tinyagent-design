@@ -9,7 +9,7 @@ export const FreePromptsContext = createContext(1);
 
 function FreeLine() {
   const free = useContext(FreePromptsContext);
-  return <p>Sign in with your radian.sh account and you get {free} free {free === 1 ? "design" : "designs"}.</p>;
+  return <p>Sign in or create a free radian.sh account and you get {free} free {free === 1 ? "design" : "designs"}.</p>;
 }
 
 export const REPO_URL = "https://github.com/superuserkalo/tinyagent-design";

@@ -20,7 +20,7 @@ export default function Account({ account, onSignIn, onSignOut }: {
   if (account.status === "signed-out") {
     return (
       <button type="button" onClick={onSignIn} className={`${button.plain} h-8 w-full justify-start px-3 font-normal text-fg-2 hover:text-fg focus-visible:ring-offset-side`}>
-        Sign in
+        Sign in or create account
       </button>
     );
   }

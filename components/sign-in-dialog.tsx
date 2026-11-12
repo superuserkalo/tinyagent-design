@@ -2,15 +2,32 @@
 
 import type { AnyState } from "@teamhanko/hanko-frontend-sdk";
 import { useEffect, useId, useRef, useState, type FormEvent } from "react";
-import { AuthFlowError, authErrorMessage, authView, hankoConfigured, run, startLogin, startRegistration } from "@/lib/client/hanko";
-import { button, cn, Dialog, DialogContent, DialogDescription, DialogTitle } from "./ui";
+import { AuthFlowError, authErrorMessage, authView, hankoConfigured, isExistingAccountError, run, startLogin, startRegistration, type AuthMode } from "@/lib/client/hanko";
+import { Close } from "./icons";
+import { button, cn, Dialog, DialogClose, DialogContent, DialogDescription, DialogTitle } from "./ui";
 
 const RESEND_SECONDS = 30;
+const TERMS_URL = "https://radian.sh/terms";
+const PRIVACY_URL = "https://radian.sh/privacy";
+
+/** The line radian.sh's own sign-up shows, with its links. */
+function Consent() {
+  const link = "text-fg underline underline-offset-4 hover:no-underline";
+  return (
+    <p className="mt-4 text-xs leading-5 text-muted">
+      By creating an account, you accept Radian&apos;s{" "}
+      <a href={TERMS_URL} target="_blank" rel="noopener noreferrer" className={link}>Terms</a> &amp;{" "}
+      <a href={PRIVACY_URL} target="_blank" rel="noopener noreferrer" className={link}>Privacy</a>.
+    </p>
+  );
+}
 
 /**
- * The sign-in modal: a title, one line, a black Sign in and a bordered
- * Cancel. Sign in continues in the same box with radian.sh's email flow: email,
- * then the code Hanko emails (or the account's password).
+ * The account modal: a title, one line, a black Create account, a bordered Sign in and
+ * Cancel. Either continues in the same box with radian.sh's email flow: email, then the
+ * code Hanko emails (or the account's password). Registration starts Hanko's registration
+ * flow directly: the login flow cannot tell a new email apart, because Hanko does not reveal
+ * which emails have accounts (it emails "not recognized" instead).
  */
 export default function SignInDialog({ open, onOpenChange, onSignedIn, startAtFlow, freePrompts }: {
   open: boolean;
@@ -22,6 +39,7 @@ export default function SignInDialog({ open, onOpenChange, onSignedIn, startAtFl
 }) {
   const designs = `${freePrompts} free ${freePrompts === 1 ? "design" : "designs"}`;
   const [step, setStep] = useState<"intro" | "flow">("intro");
+  const [mode, setMode] = useState<AuthMode>("signin");
   const [flow, setFlow] = useState<AnyState | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -35,6 +53,7 @@ export default function SignInDialog({ open, onOpenChange, onSignedIn, startAtFl
     if (!open) return;
     live.current += 1;
     setStep(startAtFlow ? "flow" : "intro");
+    setMode("signin");
     setFlow(null);
     setError(null);
     setBusy(false);
@@ -85,7 +104,7 @@ export default function SignInDialog({ open, onOpenChange, onSignedIn, startAtFl
     event.preventDefault();
     const form = event.currentTarget;
     const data = new FormData(form);
-    const view = authView(flow);
+    const view = authView(flow, mode);
     const values: Record<string, string> = {};
     for (const field of view.fields) {
       const value = String(data.get(field.name) ?? "");
@@ -101,12 +120,18 @@ export default function SignInDialog({ open, onOpenChange, onSignedIn, startAtFl
     void perform(async (epoch) => {
       // Codes and passwords live only in this submission.
       for (const input of form.querySelectorAll<HTMLInputElement>('input[type="password"], input[autocomplete="one-time-code"]')) input.value = "";
-      let state = flow ?? await startLogin();
+      let state = flow ?? (mode === "register" ? await startRegistration() : await startLogin());
       let next = await run(state, primary.action, values);
-      // A new email: create the radian.sh account with it instead.
+      // A new email on sign-in (when Hanko says so): create the radian.sh account with it instead.
       if (next.name === "login_init" && next.error?.code === "unknown_email_error" && values.email) {
         state = await startRegistration();
         next = await run(state, "register_login_identifier", { email: values.email });
+      }
+      // An existing email on registration: sign in with it instead.
+      if (next.name === "registration_init" && isExistingAccountError(next.error?.code) && values.email) {
+        if (live.current === epoch) setMode("signin");
+        state = await startLogin();
+        next = await run(state, "continue_with_login_identifier", { email: values.email });
       }
       await accept(next, epoch, primary.action);
     });
@@ -119,7 +144,9 @@ export default function SignInDialog({ open, onOpenChange, onSignedIn, startAtFl
     });
   }
 
-  const view = authView(flow);
+  const view = authView(flow, mode);
+  const atStart = !flow || flow.name === "login_init" || flow.name === "registration_init";
+  const switchMode = (next: AuthMode) => { live.current += 1; setMode(next); setFlow(null); setError(null); setBusy(false); setStep("flow"); };
   const fieldError = view.fields.some((field) => field.input.error);
   const flowError = flow?.error && !(flow.error.code === "form_data_invalid_error" && fieldError) ? authErrorMessage(flow.error.code) : null;
   const message = error ?? flowError ?? (view.unsupported ? "This step could not be shown here. Sign in at radian.sh, then come back." : null);
@@ -128,28 +155,32 @@ export default function SignInDialog({ open, onOpenChange, onSignedIn, startAtFl
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent aria-describedby={undefined}>
+        <DialogClose
+          aria-label="close"
+          className="absolute right-4 top-4 inline-flex size-8 items-center justify-center text-muted outline-none transition-colors hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <Close />
+        </DialogClose>
         {step === "intro" ? (
           <>
-            <DialogTitle className="text-lg font-medium">Sign in with your Radian account</DialogTitle>
-            <DialogDescription className="mt-2 text-sm text-muted">You get {designs}.</DialogDescription>
+            <DialogTitle className="text-lg font-medium">Use a Radian account</DialogTitle>
+            <DialogDescription className="mt-2 text-sm text-muted">Create one or sign in. You get {designs}.</DialogDescription>
             <div className="mt-5 flex flex-wrap gap-2">
-              <button
-                type="button"
-                className={button.primary}
-                disabled={!hankoConfigured()}
-                onClick={() => setStep("flow")}
-              >
+              <button type="button" className={button.primary} disabled={!hankoConfigured()} onClick={() => switchMode("register")}>
+                Create account
+              </button>
+              <button type="button" className={button.outline} disabled={!hankoConfigured()} onClick={() => switchMode("signin")}>
                 Sign in
               </button>
-              <button type="button" className={button.outline} onClick={() => onOpenChange(false)}>Cancel</button>
             </div>
+            <Consent />
             {!hankoConfigured() && <p role="alert" className="mt-3 text-sm text-muted">Sign-in is not configured on this deployment.</p>}
           </>
         ) : (
           <>
-            <DialogTitle className="text-lg font-medium">{view.title ?? "Sign in with your Radian account"}</DialogTitle>
+            <DialogTitle className="text-lg font-medium">{view.title ?? (mode === "register" ? "Create your Radian account" : "Sign in with your Radian account")}</DialogTitle>
             <DialogDescription className="mt-2 text-sm text-muted">
-              {view.description ?? (flow?.name === "registration_init" ? `Create your radian.sh account. You get ${designs}.` : "Use your radian.sh email. New here? We create your account.")}
+              {view.description ?? (mode === "register" ? `Your email, then a code we send you. You get ${designs}.` : "Use your radian.sh email.")}
             </DialogDescription>
             {view.primary && (
               <form ref={formRef} key={`${flow?.name ?? "init"}-${revision}`} onSubmit={submit} className="mt-4">
@@ -180,6 +211,16 @@ export default function SignInDialog({ open, onOpenChange, onSignedIn, startAtFl
                 ))}
               </div>
             )}
+            {atStart && (
+              <p className="mt-4 text-sm text-muted">
+                {mode === "register" ? "Have an account? " : "New to Radian? "}
+                <button type="button" disabled={busy} onClick={() => switchMode(mode === "register" ? "signin" : "register")}
+                  className="text-fg underline underline-offset-4 outline-none hover:no-underline focus-visible:ring-2 focus-visible:ring-ring">
+                  {mode === "register" ? "Sign in" : "Create an account"}
+                </button>
+              </p>
+            )}
+            {mode === "register" && atStart && <Consent />}
             {!view.primary && (
               <div className="mt-5 flex gap-2">
                 <button type="button" className={button.outline} onClick={() => onOpenChange(false)}>Cancel</button>

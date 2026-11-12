@@ -253,7 +253,7 @@ export default function DesignApp({ model: initialModel, freePrompts: initialFre
       onSelect={select}
       onNew={newDesign}
       onDelete={(id) => void runtime?.hide(id)}
-      account={<Account account={account} onSignIn={() => openSignIn(true)} onSignOut={doSignOut} />}
+      account={<Account account={account} onSignIn={() => openSignIn(false)} onSignOut={doSignOut} />}
     />
   );
 
@@ -365,7 +365,7 @@ export default function DesignApp({ model: initialModel, freePrompts: initialFre
 
           <div className="order-3 shrink-0 lg:order-none">
             <Composer ref={composer} busy={busy} locked={active.watching} stopping={stopping} model={model} quota={quota} onSend={send}
-              onStop={() => { setStopping(true); runtime?.stop(); }} onSignIn={() => openSignIn(true)} />
+              onStop={() => { setStopping(true); runtime?.stop(); }} onSignIn={() => openSignIn(false)} />
           </div>
         </section>
 

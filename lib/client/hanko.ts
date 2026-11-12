@@ -84,12 +84,17 @@ const fieldInfo: Record<string, { label: string; type: string; autocomplete: str
   otp_code: { label: "Authentication code", type: "text", autocomplete: "one-time-code" },
 };
 
-export function authView(state: AnyState | null): AuthView {
+/** Whether a person is signing in to an account they have, or creating one. */
+export type AuthMode = "signin" | "register";
+
+export function authView(state: AnyState | null, mode: AuthMode = "signin"): AuthView {
   const view: AuthView = { fields: [], choices: [] };
   const primary = (action: string, label: string) => { view.primary = { action, label }; };
   const choice = (action: string, label: string) => { if (findAction(state, action)) view.choices.push({ action, label }); };
   if (!state) {
-    view.primary = { action: "continue_with_login_identifier", label: "Continue" };
+    view.primary = mode === "register"
+      ? { action: "register_login_identifier", label: "Create account" }
+      : { action: "continue_with_login_identifier", label: "Continue" };
     view.fields = [{ name: "email", ...fieldInfo.email, input: { name: "email", type: "email", required: true, max_length: 120 } }];
     return view;
   }
@@ -180,6 +185,12 @@ const errors: Record<string, string> = {
   form_data_invalid_error: "Check the field and try again.",
 };
 
+/** Registration refused an email that already has an account. */
+export function isExistingAccountError(code?: string): boolean {
+  return Boolean(code && /already_exists|already_registered|exists_error/.test(code));
+}
+
 export function authErrorMessage(code?: string): string {
+  if (isExistingAccountError(code)) return "This email already has a Radian account. Sign in instead.";
   return code && errors[code] ? errors[code] : "We could not complete that request.";
 }
