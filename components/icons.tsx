@@ -68,7 +68,7 @@ export function ArrowUp() {
 export function StopSquare() {
   return (
     <svg viewBox="0 0 16 16" className="size-3.5" fill="currentColor" aria-hidden="true">
-      <rect x="3.5" y="3.5" width="9" height="9" />
+      <rect x="3.5" y="3.5" width="9" height="9" rx="1.5" />
     </svg>
   );
 }
@@ -147,10 +147,29 @@ export function Download() {
   );
 }
 
-export function Check() {
+export function Check({ className = "size-4" }: { className?: string }) {
   return (
-    <svg viewBox="0 0 16 16" className="size-4" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+    <svg viewBox="0 0 16 16" className={className} fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
       <path d="m3 8 3 3 7-7" />
+    </svg>
+  );
+}
+
+/** A chevron in a circle: closed points right, open points down. */
+export function ChevronCircle({ open }: { open: boolean }) {
+  return (
+    <svg viewBox="0 0 16 16" className="size-[13px] shrink-0" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true">
+      <circle cx="8" cy="8" r="6.8" />
+      <path d={open ? "M5.4 6.9 8 9.5l2.6-2.6" : "M6.9 5.4 9.5 8l-2.6 2.6"} />
+    </svg>
+  );
+}
+
+/** A paperclip: one wire, bent back on itself twice. */
+export function Paperclip() {
+  return (
+    <svg viewBox="0 0 24 24" className="size-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M16.5 7.5 8.3 15.7a2.1 2.1 0 0 0 3 3l8.6-8.6a4.3 4.3 0 0 0-6.1-6.1l-8.9 8.9a6.4 6.4 0 0 0 9.1 9.1l7.3-7.3" />
     </svg>
   );
 }
