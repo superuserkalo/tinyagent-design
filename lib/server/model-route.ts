@@ -6,10 +6,9 @@
 // for reporting. The gateway's SSE stream comes back unbuffered. No credential
 // ever reaches the browser.
 import { INSTRUCTIONS } from "../agent.ts";
-import { TOOL_NAMES } from "../tools.ts";
 import { GATEWAY_URL, MAX_MODEL_BODY_BYTES, MAX_OUTPUT_TOKENS } from "./config.ts";
 import type { UserLookup } from "./hanko.ts";
-import { validateImages } from "./images.ts";
+import { validateRequest } from "./request-shape.ts";
 import { json, sameOrigin } from "./origin.ts";
 import { useGrant } from "./quota.ts";
 import type { QuotaStore } from "./store.ts";
@@ -27,25 +26,7 @@ export interface ModelRouteDeps {
 
 const fail = (status: number, code: string, message: string) => json({ error: { code, message } }, status);
 
-type Message = { role: string; content?: unknown; tool_calls?: unknown; tool_call_id?: unknown; name?: unknown };
-
-function validMessages(value: unknown): value is Message[] {
-  return Array.isArray(value) && value.length > 0 && value.length <= 400 &&
-    value.every((message) => typeof message === "object" && message !== null && typeof (message as Message).role === "string" &&
-      ["system", "developer", "user", "assistant", "tool"].includes((message as Message).role));
-}
-
-function toolNames(value: unknown): string[] | null {
-  if (value === undefined) return [];
-  if (!Array.isArray(value)) return null;
-  const names: string[] = [];
-  for (const tool of value) {
-    const name = (tool as { function?: { name?: unknown } })?.function?.name;
-    if (typeof name !== "string") return null;
-    names.push(name);
-  }
-  return names;
-}
+type Message = { role: string; content?: unknown };
 
 export async function handleModelRequest(request: Request, deps: ModelRouteDeps): Promise<Response> {
   if (!sameOrigin(request, { requireOrigin: true })) return fail(403, "forbidden_origin", "Requests must come from this site.");
@@ -66,13 +47,9 @@ export async function handleModelRequest(request: Request, deps: ModelRouteDeps)
   } catch {
     return fail(400, "invalid_json", "The request body is not JSON.");
   }
-  if (typeof body !== "object" || body === null || !validMessages(body.messages))
-    return fail(400, "invalid_request", "messages must be a list of chat messages.");
-  const names = toolNames(body.tools);
-  if (!names || names.some((name) => !(TOOL_NAMES as readonly string[]).includes(name)))
-    return fail(400, "invalid_tools", "Only this site's tools may be sent.");
-  const imageError = validateImages(body.messages as Message[]);
-  if (imageError) return fail(400, "invalid_images", imageError.charAt(0).toUpperCase() + imageError.slice(1) + ".");
+  const problem = validateRequest(body);
+  if (problem) return fail(400, problem.includes("image") ? "invalid_images" : problem.includes("tool") ? "invalid_tools" : "invalid_request",
+    problem.charAt(0).toUpperCase() + problem.slice(1) + ".");
 
   // Counted only once the request is known to be well formed.
   let use;
@@ -93,7 +70,7 @@ export async function handleModelRequest(request: Request, deps: ModelRouteDeps)
   const forwarded: Record<string, unknown> = {
     model: deps.model,
     messages,
-    ...(names.length ? { tools: body.tools } : {}),
+    ...(Array.isArray(body.tools) && body.tools.length ? { tools: body.tools } : {}),
     stream: true,
     stream_options: { include_usage: true },
     max_tokens: MAX_OUTPUT_TOKENS,

@@ -155,7 +155,7 @@ const Composer = forwardRef<ComposerHandle, {
       <QuotaPill quota={quota} model={model} onSignIn={onSignIn} />
       <div className="mx-auto max-w-2xl">
         {(images.length > 0 || adding > 0) && (
-          <div className="flex flex-wrap items-start gap-2 px-3 pt-3">
+          <div className="flex flex-wrap items-start gap-3 px-3 pt-3">
             {images.map((image, index) => (
               <div key={`${image.data.slice(-16)}-${index}`} className="relative">
                 <ImageThumb src={image.url} alt={`Attached image ${index + 1}`} className="h-auto max-h-14 w-auto max-w-28 outline outline-1 -outline-offset-1 outline-black/10 dark:outline-white/10" />
