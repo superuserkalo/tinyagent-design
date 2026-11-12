@@ -82,7 +82,8 @@ export async function handleModelRequest(request: Request, deps: ModelRouteDeps)
     max_tokens: MAX_OUTPUT_TOKENS,
     ...reasoning.top,
     user: user.id,
-    providerOptions: { gateway: { user: user.id, tags: ["app:tinyagent-design"] }, ...reasoning.provider },
+    // caching "auto": the long system prompt (brief and starter scenes) is cached by the provider.
+    providerOptions: { gateway: { user: user.id, tags: ["app:tinyagent-design"], caching: "auto" }, ...reasoning.provider },
   };
 
   // A call this tab (or another) already started: replay it and follow it. Not charged again.

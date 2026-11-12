@@ -1,0 +1,543 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jelly Blocks</title>
+<style>
+  :root { --bg: #ece6da; --fg: #1c1a18; --muted: #77706a; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); overflow: hidden; }
+  body { font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; cursor: grab; }
+  canvas.holding { cursor: grabbing; }
+  .hud { position: fixed; left: 20px; bottom: 18px; right: 20px; pointer-events: none; }
+  .hud h1 { margin: 0; font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
+  .hud p { margin: 2px 0 0; color: var(--muted); }
+  .fallback { position: fixed; inset: 0; display: none; place-items: center; padding: 24px; text-align: center; color: var(--muted); }
+</style>
+</head>
+<body>
+<canvas id="c" aria-label="Five jelly cubes on a studio floor. Grab one, drag it and throw it."></canvas>
+<div class="hud"><h1>Jelly blocks</h1><p>Grab a block and throw it. Tap the floor to make them jump.</p></div>
+<div class="fallback" id="fallback">This scene needs WebGPU. Try a current Chrome, Edge or Safari.</div>
+<script>
+(async () => {
+  const { init, surface, draw, storage, geometry, frameLoop, clock, prepareShader, scene } = vgpu;
+  const canvas = document.getElementById("c");
+  let gpu;
+  try { gpu = await init(); } catch { document.getElementById("fallback").style.display = "grid"; return; }
+
+  const screen = surface(gpu, canvas, { dpr: [1, 2], depth: true, msaa: true, clearColor: [0.925, 0.902, 0.855, 1] });
+  const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  // Palette "bone and rust": ground #ece6da, ink #1c1a18, accent #c2410c.
+  // The five jellies are mixes of those three colours, nothing added.
+  const BLOCKS = [
+    { h: 0.50, color: "#c2410c", at: [-0.25, 0.0, -0.25], yaw: 0.35 },  // h = half the edge length
+    { h: 0.36, color: "#d58b69", at: [1.15, 0.0, 0.25], yaw: -0.4 },
+    { h: 0.31, color: "#1c1a18", at: [-1.35, 0.0, 0.5], yaw: 0.6 },
+    { h: 0.26, color: "#e4c5b1", at: [0.3, 0.0, 1.05], yaw: 0.95 },
+    { h: 0.22, color: "#802d11", at: [-0.2, 1.0, -0.2], yaw: -0.15 },  // stacked on the big one
+  ];
+  const COUNT = BLOCKS.length;
+  const STAGE = { x: 2.4, z: 1.8, top: 3.6 };  // the invisible box the blocks live in; the floor is y = 0
+  const GRAVITY = 9.8, SUBSTEPS = 4;
+
+  // ---------- Background: a pale paper sweep, drawn first with depth off ----------
+  const background = draw(gpu, { label: "background", vertices: 3, cull: "none", depth: { write: false, compare: "always" }, shader: prepareShader(`
+    struct BgOut { @builtin(position) clip: vec4f, @location(0) uv: vec2f }
+    @vertex fn vs_main(@builtin(vertex_index) i: u32) -> BgOut {
+      let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u)) * 2.0 - 1.0;      // fullscreen triangle
+      return BgOut(vec4f(p, 0.0, 1.0), p * 0.5 + 0.5);                  // uv.y = 1 at the top
+    }
+    @fragment fn fs_main(in: BgOut) -> @location(0) vec4f {
+      let uv = in.uv;
+      let top = pow(vec3f(0.965, 0.95, 0.92), vec3f(2.2)); let bottom = pow(vec3f(0.89, 0.855, 0.79), vec3f(2.2));
+      var c = mix(bottom, top, smoothstep(0.0, 1.0, uv.y));
+      let v = length((uv - vec2f(0.5, 0.55)) * vec2f(1.3, 1.0));
+      c *= 1.0 - 0.22 * smoothstep(0.35, 0.95, v);                       // light vignette: a pale ground turns grey fast
+      c += (fract(sin(dot(uv * 913.0, vec2f(12.9898, 78.233))) * 43758.5453) - 0.5) * 0.012; // grain
+      return vec4f(pow(c, vec3f(1.0 / 2.2)), 1.0);
+    }
+  `) });
+
+  // ---------- Per-block data the GPU reads every frame ----------
+  // The CPU owns the physics (5 bodies is nothing) and writes, per block, an affine map
+  // (origin + 3 columns: rotation * size * wobble), its normal matrix, colour and shadow footprint.
+  const BLOCK_STRUCT = `
+    struct Camera { viewProjection: mat4x4f, eye: vec4f }
+    struct Block {
+      origin: vec4f, l0: vec4f, l1: vec4f, l2: vec4f,   // world = origin + mat3(l0, l1, l2) * p, p on the unit rounded cube
+      n0: vec4f, n1: vec4f, n2: vec4f,                  // normal matrix (inverse transpose of the above, unnormalized)
+      color: vec4f,                                     // sRGB albedo
+      shape: vec4f,                                     // x: barrel bulge, y: half height
+      foot: vec4f, footAt: vec4f,                       // shadow axes (ax, az, bx, bz); centre (x, z) and height above the floor
+    }
+    @group(0) @binding(0) var<uniform> camera: Camera;
+    @group(0) @binding(1) var<storage, read> blocks: array<Block>;
+  `;
+  const FLOATS = 44;
+  const packed = new Float32Array(COUNT * FLOATS);
+  const blockBuffer = storage(gpu, packed.byteLength);
+
+  // ---------- Contact shadows: a soft tinted rounded square under each block, multiplied onto the floor ----------
+  const shadows = draw(gpu, {
+    label: "shadows", vertices: 6, instances: COUNT, cull: "none", depth: { write: false },
+    blend: { color: { src: "dst", dst: "zero" }, alpha: { src: "zero", dst: "one" } },  // multiply
+    shader: prepareShader(`
+      ${BLOCK_STRUCT}
+      struct SOut { @builtin(position) clip: vec4f, @location(0) uv: vec2f, @location(1) lift: f32, @location(2) tint: vec3f }
+      @vertex fn vs_main(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> SOut {
+        var corner = array<vec2f, 6>(vec2f(-1,-1), vec2f(1,-1), vec2f(1,1), vec2f(-1,-1), vec2f(1,1), vec2f(-1,1));
+        let b = blocks[i];
+        let lift = max(b.footAt.z, 0.0);
+        let k = corner[v] * (1.5 + lift * 1.4);          // the shadow spreads as the block rises
+        let xz = b.footAt.xy + b.foot.xy * k.x + b.foot.zw * k.y;
+        var o: SOut;
+        o.clip = camera.viewProjection * vec4f(xz.x, 0.0, xz.y, 1.0);
+        o.uv = k; o.lift = lift; o.tint = b.color.rgb;
+        return o;
+      }
+      @fragment fn fs_main(in: SOut) -> @location(0) vec4f {
+        let d = length(max(abs(in.uv) - vec2f(0.5), vec2f(0.0))) - 0.5;   // rounded square, footprint = [-1, 1]^2
+        let blur = 0.35 + in.lift * 1.6;
+        let soft = (1.0 - smoothstep(-blur, blur, d)) * 0.42 * exp(-in.lift * 0.8);
+        let contact = (1.0 - smoothstep(-0.25, 0.12, d)) * 0.38 * exp(-in.lift * 10.0);
+        // Light passes through jelly, so its shadow carries a little of its colour.
+        let tint = mix(vec3f(0.11, 0.1, 0.094), in.tint * 0.55, 0.45);
+        return vec4f(mix(vec3f(1.0), tint, clamp(soft + contact, 0.0, 1.0)), 1.0);
+      }
+    `),
+    set: { blocks: blockBuffer },
+  });
+
+  // ---------- The jellies: one icosphere pushed out to a rounded cube, instanced ----------
+  const jelly = draw(gpu, {
+    label: "jelly", geometry: geometry(gpu, scene.icosphere({ subdivisions: 5 })), instances: COUNT, cull: "back",
+    shader: prepareShader(`
+      ${BLOCK_STRUCT}
+      const ROUND: f32 = 5.0;     // superellipsoid exponent: 2 is a sphere, higher is a sharper cube
+      struct JOut { @builtin(position) clip: vec4f, @location(0) world: vec3f, @location(1) normal: vec3f, @location(2) albedo: vec3f, @location(3) occlusion: f32 }
+      @vertex fn vs_main(@location(0) position: vec3f, @location(1) normal: vec3f, @location(2) uv: vec2f,
+                         @builtin(instance_index) i: u32) -> JOut {
+        let b = blocks[i];
+        // Project the sphere direction onto |x|^R + |y|^R + |z|^R = 1: a soft-cornered cube.
+        let d = normalize(position);
+        let a = abs(d);
+        let p = d / pow(pow(a.x, ROUND) + pow(a.y, ROUND) + pow(a.z, ROUND), 1.0 / ROUND);
+        let grad = sign(p) * pow(abs(p), vec3f(ROUND - 1.0));            // its normal, in the cube's frame
+        var q = mat3x3f(b.l0.xyz, b.l1.xyz, b.l2.xyz) * p;                // rotate, size and squash
+        // Barrel bulge: a squashed jelly swells most around its middle.
+        let y = clamp(q.y / b.shape.y, -1.0, 1.0);
+        let swell = 1.0 + b.shape.x * (1.0 - y * y);
+        q = vec3f(q.x * swell, q.y, q.z * swell);
+        var o: JOut;
+        o.world = b.origin.xyz + q;
+        o.clip = camera.viewProjection * vec4f(o.world, 1.0);
+        o.normal = mat3x3f(b.n0.xyz, b.n1.xyz, b.n2.xyz) * grad;
+        o.albedo = pow(b.color.rgb, vec3f(2.2));
+        // Contact darkening where this jelly nears another: take the vertex into each other block's
+        // unit-cube frame (inverse of its affine map = transpose(normal matrix) / det) and measure the gap.
+        o.occlusion = smoothstep(0.0, 0.25, o.world.y);                   // the floor
+        for (var j = 0u; j < arrayLength(&blocks); j++) {
+          if (j == i) { continue; }
+          let other = blocks[j];
+          let inv = transpose(mat3x3f(other.n0.xyz, other.n1.xyz, other.n2.xyz));
+          let local = inv * (o.world - other.origin.xyz) / dot(other.l0.xyz, other.n0.xyz);
+          let gap = length(max(abs(local) - vec3f(1.0), vec3f(0.0))) * length(other.l0.xyz);
+          o.occlusion *= 1.0 - 0.7 * exp(-gap * 9.0);
+        }
+        return o;
+      }
+      fn aces(x: vec3f) -> vec3f { return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), vec3f(0.0), vec3f(1.0)); }
+      @fragment fn fs_main(in: JOut) -> @location(0) vec4f {
+        let n = normalize(in.normal);
+        let v = normalize(camera.eye.xyz - in.world);
+        let l = normalize(vec3f(-0.5, 0.8, 0.45));                        // key light (a softbox, top left)
+        let ndv = clamp(dot(n, v), 0.0, 1.0);
+        let ground = pow(vec3f(0.925, 0.902, 0.855), vec3f(2.2));
+        // Fake subsurface: facing us, light crosses the whole block and comes out deep and saturated;
+        // near the silhouette the path is short, so the jelly glows lighter there.
+        let deep = in.albedo * in.albedo * 1.1;
+        let thin = pow(in.albedo, vec3f(0.55)) * 1.1;
+        let body = mix(deep, thin, pow(1.0 - ndv, 1.4));
+        let wrap = clamp((dot(n, l) + 0.5) / 1.5, 0.0, 1.0);              // soft wrap diffuse: light bleeds round the edges
+        let sky = mix(ground * 0.35, vec3f(0.9, 0.88, 0.85), n.y * 0.5 + 0.5) * 0.55;
+        var c = body * (wrap * 1.35 + sky);
+        c += thin * 0.3 * smoothstep(0.0, 1.0, n.y) * (1.0 - ndv);         // light caught inside the top edge
+        // Gloss: reflect a bright studio with one rectangular softbox, weighted by fresnel.
+        let r = reflect(-v, n);
+        var env = mix(ground * 0.6, vec3f(1.15, 1.13, 1.1), smoothstep(-0.1, 0.4, r.y));
+        let t1 = normalize(cross(l, vec3f(0.0, 1.0, 0.0)));
+        let t2 = cross(t1, l);
+        let sb = (1.0 - smoothstep(0.22, 0.3, abs(dot(r, t1)))) * (1.0 - smoothstep(0.14, 0.2, abs(dot(r, t2)))) * step(0.0, dot(r, l));
+        env += vec3f(5.0) * sb;
+        env += vec3f(1.6) * (smoothstep(0.16, 0.2, r.y) - smoothstep(0.3, 0.36, r.y));   // the studio's far wall: a crisp line along every rounded edge
+        let fresnel = 0.04 + 0.96 * pow(1.0 - ndv, 5.0);
+        c = mix(c, env, fresnel) + vec3f(sb) * 0.35;
+        let h = normalize(l + v);
+        c += vec3f(pow(max(dot(n, h), 0.0), 240.0) * 2.5);                // tight hot specular
+        c += pow(1.0 - ndv, 4.0) * 0.5 * mix(thin, vec3f(1.0), 0.5);      // fresnel rim
+        c *= mix(0.5, 1.0, in.occlusion);                                 // contact darkening near the floor and other blocks
+        return vec4f(pow(aces(c), vec3f(1.0 / 2.2)), 1.0);
+      }
+    `),
+    set: { blocks: blockBuffer },
+  });
+
+  // ---------- Bodies ----------
+  const hex = (s) => [1, 3, 5].map((k) => parseInt(s.slice(k, k + 2), 16) / 255);
+  const bodies = BLOCKS.map((d) => ({
+    h: d.h, mass: d.h ** 3, color: hex(d.color),
+    c: [d.at[0], d.at[1] + d.h, d.at[2]], v: [0, 0, 0],         // centre and velocity
+    q: [0, Math.sin(d.yaw / 2), 0, Math.cos(d.yaw / 2)], w: [0, 0, 0],  // orientation and angular velocity
+    R: new Float32Array(9),                                     // rotation matrix, column-major (cached from q)
+    // The wobble: a 3x3 strain E (world frame, row-major) on a damped spring, F = I + E.
+    // Impacts kick its rate; it rings a few times and settles. Er is where the spring rests.
+    E: new Float32Array(9), Ed: new Float32Array(9), Er: new Float32Array(9),
+    pivot: [0, 0, 0],         // offset from the centre that the wobble squashes about (floor contact or the grabbed point)
+    ground: false,            // resting on the floor or on another block this step
+    omega: 2 * Math.PI * 2.8 * Math.sqrt(0.35 / d.h),  // bigger jelly, slower wobble
+    phase: Math.random() * 6.283, hopAt: -1,
+    rebound: 0, reboundIn: 0, // a floor bounce waits until the squash has sprung back (about half a wobble)
+  }));
+
+  const rotationFromQuat = (b) => {
+    const [x, y, z, w] = b.q, R = b.R;
+    R[0] = 1 - 2 * (y * y + z * z); R[1] = 2 * (x * y + z * w);     R[2] = 2 * (x * z - y * w);
+    R[3] = 2 * (x * y - z * w);     R[4] = 1 - 2 * (x * x + z * z); R[5] = 2 * (y * z + x * w);
+    R[6] = 2 * (x * z + y * w);     R[7] = 2 * (y * z - x * w);     R[8] = 1 - 2 * (x * x + y * y);
+  };
+  bodies.forEach(rotationFromQuat);
+  // Half extent of the (rigid) block along a unit direction: how far it reaches towards a wall.
+  const support = (b, nx, ny, nz) => {
+    const R = b.R;
+    return b.h * (Math.abs(nx * R[0] + ny * R[1] + nz * R[2]) + Math.abs(nx * R[3] + ny * R[4] + nz * R[5]) + Math.abs(nx * R[6] + ny * R[7] + nz * R[8]));
+  };
+  // Squash along n (and bulge across it), volume preserving: E rate += amount * (I/2 - 3/2 n n^T).
+  // A negative amount stretches along n instead.
+  const n3 = [0, 0, 0];
+  const kick = (b, nx, ny, nz, amount) => {
+    n3[0] = nx; n3[1] = ny; n3[2] = nz;
+    for (let r = 0; r < 3; r++) for (let k = 0; k < 3; k++) b.Ed[r * 3 + k] += amount * ((r === k ? 0.5 : 0) - 1.5 * n3[r] * n3[k]);
+  };
+  const impact = (b, nx, ny, nz, speed) => { if (speed > 0.6) kick(b, nx, ny, nz, Math.min(9, speed * 1.3)); };
+
+  // ---------- Pointer state ----------
+  let held = null;                                        // the body in the hand
+  const grabLocal = [0, 0, 0], grabOffset = [0, 0, 0], grabTarget = [0, 0, 0], planeN = [0, 0, 0], planeP = [0, 0, 0];
+  const clampStage = (x, limit) => Math.max(-limit, Math.min(limit, x));
+
+  // ---------- Physics step (semi-implicit Euler, positions projected out of contacts) ----------
+  const stageContact = (b, dt) => {
+    const sx = support(b, 1, 0, 0), sy = support(b, 0, 1, 0), sz = support(b, 0, 0, 1);
+    if (b.c[1] < sy) {                                    // floor
+      b.c[1] = sy; b.ground = true;
+      const speed = -b.v[1];
+      if (speed > 0) {
+        b.v[1] = 0; impact(b, 0, 1, 0, speed);
+        if (speed > 0.7 && b !== held) { b.rebound = speed * 0.4; b.reboundIn = (0.8 * Math.PI) / b.omega; }
+      }
+      // Friction at the contact point under the centre: slows the slide and turns it into a tumble.
+      const px = b.v[0] + b.w[2] * sy, pz = b.v[2] - b.w[0] * sy;
+      const inertia = (2 * b.h * b.h) / 3;                 // I / m for a cube
+      let fx = -px / (1 + (sy * sy) / inertia), fz = -pz / (1 + (sy * sy) / inertia);
+      const limit = 0.6 * (Math.max(speed, 0) + GRAVITY * dt), f = Math.hypot(fx, fz);
+      if (f > limit) { fx *= limit / f; fz *= limit / f; }
+      b.v[0] += fx; b.v[2] += fz;
+      b.w[0] += (-sy * fz) / inertia; b.w[2] += (sy * fx) / inertia;
+    }
+    if (b.c[1] > STAGE.top - sy) { b.c[1] = STAGE.top - sy; if (b.v[1] > 0) { impact(b, 0, -1, 0, b.v[1]); b.v[1] *= -0.4; } }
+    if (b.c[0] < -STAGE.x + sx) { b.c[0] = -STAGE.x + sx; if (b.v[0] < 0) { impact(b, 1, 0, 0, -b.v[0]); b.v[0] *= -0.45; } }
+    if (b.c[0] > STAGE.x - sx) { b.c[0] = STAGE.x - sx; if (b.v[0] > 0) { impact(b, -1, 0, 0, b.v[0]); b.v[0] *= -0.45; } }
+    if (b.c[2] < -STAGE.z + sz) { b.c[2] = -STAGE.z + sz; if (b.v[2] < 0) { impact(b, 0, 0, 1, -b.v[2]); b.v[2] *= -0.45; } }
+    if (b.c[2] > STAGE.z - sz) { b.c[2] = STAGE.z - sz; if (b.v[2] > 0) { impact(b, 0, 0, -1, b.v[2]); b.v[2] *= -0.45; } }
+  };
+
+  // Block against block: separating-axis test on the six face axes of the two boxes. The axis
+  // with the least overlap is the contact normal (exact for stacks and face-to-face hits;
+  // edge-on-edge hits may sink in a little, which a jelly gets away with).
+  const pairContact = (a, b, dt) => {
+    const dx = b.c[0] - a.c[0], dy = b.c[1] - a.c[1], dz = b.c[2] - a.c[2];
+    if (Math.hypot(dx, dy, dz) > 1.75 * (a.h + b.h)) return;   // too far apart to touch
+    let overlap = Infinity, nx = 0, ny = 1, nz = 0;
+    for (let i = 0; i < 6; i++) {
+      const R = (i < 3 ? a : b).R, k = (i % 3) * 3, ux = R[k], uy = R[k + 1], uz = R[k + 2];
+      const along = dx * ux + dy * uy + dz * uz;
+      const o = support(a, ux, uy, uz) + support(b, ux, uy, uz) - Math.abs(along);
+      if (o <= 0) return;                                   // a separating axis: no contact
+      if (o < overlap) { const s = along < 0 ? -1 : 1; overlap = o; nx = ux * s; ny = uy * s; nz = uz * s; }
+    }
+    const wa = a === held ? 0 : 1 / a.mass, wb = b === held ? 0 : 1 / b.mass, ws = wa + wb;
+    if (ws === 0) return;
+    a.c[0] -= nx * overlap * wa / ws; a.c[1] -= ny * overlap * wa / ws; a.c[2] -= nz * overlap * wa / ws;
+    b.c[0] += nx * overlap * wb / ws; b.c[1] += ny * overlap * wb / ws; b.c[2] += nz * overlap * wb / ws;
+    const rvx = b.v[0] - a.v[0], rvy = b.v[1] - a.v[1], rvz = b.v[2] - a.v[2];
+    const vn = rvx * nx + rvy * ny + rvz * nz;
+    if (vn < 0) {
+      const j = (-(1 + (vn < -0.8 ? 0.3 : 0)) * vn) / ws;
+      a.v[0] -= nx * j * wa; a.v[1] -= ny * j * wa; a.v[2] -= nz * j * wa;
+      b.v[0] += nx * j * wb; b.v[1] += ny * j * wb; b.v[2] += nz * j * wb;
+      impact(a, -nx, -ny, -nz, -vn); impact(b, nx, ny, nz, -vn);
+      // A little friction so a stack does not skate apart.
+      const tx = rvx - vn * nx, ty = rvy - vn * ny, tz = rvz - vn * nz, f = 0.25 / ws;
+      a.v[0] += tx * f * wa; a.v[1] += ty * f * wa; a.v[2] += tz * f * wa;
+      b.v[0] -= tx * f * wb; b.v[1] -= ty * f * wb; b.v[2] -= tz * f * wb;
+    }
+    if (ny > 0.6) rest(b, a, dt);                         // b rests on a
+    if (ny < -0.6) rest(a, b, dt);
+  };
+  // A block resting on another: it counts as grounded, and if its centre hangs past the
+  // lower block's edge it slides and tips off instead of balancing on the corner.
+  const rest = (top, base, dt) => {
+    top.ground = true;
+    const hx = top.c[0] - base.c[0], hz = top.c[2] - base.c[2], d = Math.hypot(hx, hz);
+    if (top === held || d < 1e-4 || d < support(base, hx / d, 0, hz / d)) return;
+    top.v[0] += (hx / d) * 6 * dt; top.v[2] += (hz / d) * 6 * dt;
+    top.w[0] += (hz / d) * 12 * dt; top.w[2] -= (hx / d) * 12 * dt;
+  };
+
+  const step = (dt) => {
+    for (const b of bodies) {
+      b.ground = false;
+      if (b.reboundIn > 0 && (b.reboundIn -= dt) <= 0) { b.v[1] += b.rebound; b.rebound = 0; }
+      if (b === held) {
+        // The grabbed point chases the pointer; the block's velocity follows with a short lag,
+        // so letting go keeps the hand's motion (that is the throw).
+        const R = b.R;
+        for (let r = 0; r < 3; r++) grabOffset[r] = R[r] * grabLocal[0] + R[r + 3] * grabLocal[1] + R[r + 6] * grabLocal[2];
+        // Where the centre should be, kept inside the stage so the hand never grinds it into the floor.
+        const tx = clampStage(grabTarget[0] - grabOffset[0], STAGE.x - support(b, 1, 0, 0));
+        const ty = Math.max(support(b, 0, 1, 0), Math.min(STAGE.top - b.h, grabTarget[1] - grabOffset[1]));
+        const tz = clampStage(grabTarget[2] - grabOffset[2], STAGE.z - support(b, 0, 0, 1));
+        const follow = 1 - Math.exp(-28 * dt);
+        const dvx = ((tx - b.c[0]) * 16 - b.v[0]) * follow, dvy = ((ty - b.c[1]) * 16 - b.v[1]) * follow, dvz = ((tz - b.c[2]) * 16 - b.v[2]) * follow;
+        b.v[0] += dvx; b.v[1] += dvy; b.v[2] += dvz;
+        // Inertia: the far side of the jelly (away from the hand) lags behind: E -= dv (x) dir.
+        const ol = Math.hypot(grabOffset[0], grabOffset[1], grabOffset[2]) || 1;
+        for (let k = 0; k < 3; k++) {
+          const d = -grabOffset[k] / ol;           // unit direction from the hand to the centre
+          b.Ed[k] -= 1.1 * dvx * d; b.Ed[3 + k] -= 1.1 * dvy * d; b.Ed[6 + k] -= 1.1 * dvz * d;
+        }
+        const spin = Math.exp(-10 * dt); b.w[0] *= spin; b.w[1] *= spin; b.w[2] *= spin;
+      } else {
+        b.v[1] -= GRAVITY * dt;
+      }
+      const s = Math.hypot(b.v[0], b.v[1], b.v[2]);
+      if (s > 14) { b.v[0] *= 14 / s; b.v[1] *= 14 / s; b.v[2] *= 14 / s; }
+      b.c[0] += b.v[0] * dt; b.c[1] += b.v[1] * dt; b.c[2] += b.v[2] * dt;
+      // q += 0.5 * (w, 0) * q * dt, then renormalize
+      const [qx, qy, qz, qw] = b.q, [wx, wy, wz] = b.w, k = 0.5 * dt;
+      b.q[0] += k * (wx * qw + wy * qz - wz * qy); b.q[1] += k * (wy * qw + wz * qx - wx * qz);
+      b.q[2] += k * (wz * qw + wx * qy - wy * qx); b.q[3] += k * (-wx * qx - wy * qy - wz * qz);
+      const ql = Math.hypot(...b.q); b.q[0] /= ql; b.q[1] /= ql; b.q[2] /= ql; b.q[3] /= ql;
+      rotationFromQuat(b);
+    }
+    for (const b of bodies) stageContact(b, dt);
+    for (let i = 0; i < COUNT; i++) for (let j = i + 1; j < COUNT; j++) pairContact(bodies[i], bodies[j], dt);
+    for (const b of bodies) {
+      if (b.ground && b !== held) {
+        // Settle onto the nearest face: torque the most upright axis towards +Y, and let the floor
+        // drain spin and slide. A jelly cube flops flat instead of balancing on an edge.
+        const R = b.R;
+        let k = 0; if (Math.abs(R[4]) > Math.abs(R[k * 3 + 1])) k = 1; if (Math.abs(R[7]) > Math.abs(R[k * 3 + 1])) k = 2;
+        const sg = Math.sign(R[k * 3 + 1]) || 1, ax = R[k * 3] * sg, az = R[k * 3 + 2] * sg;
+        b.w[0] += -az * 45 * dt; b.w[2] += ax * 45 * dt;
+        const damp = Math.exp(-5 * dt), slide = Math.exp(-1.2 * dt);
+        b.w[0] *= damp; b.w[1] *= damp; b.w[2] *= damp; b.v[0] *= slide; b.v[2] *= slide;
+      }
+      // The wobble spring: E'' = -omega^2 (E - Er) - 2 zeta omega E'
+      const om = b.omega, zeta = 0.11;
+      for (let k = 0; k < 9; k++) {
+        b.Ed[k] += (-om * om * (b.E[k] - b.Er[k]) - 2 * zeta * om * b.Ed[k]) * dt;
+        b.Ed[k] = Math.max(-14, Math.min(14, b.Ed[k]));   // many hits in one frame must not add up to a pancake
+        b.E[k] = Math.max(-0.38, Math.min(0.38, b.E[k] + b.Ed[k] * dt));
+      }
+    }
+  };
+
+  // A hop: stretch up, leave the floor, maybe tumble a quarter turn.
+  const hop = (b, power, dx, dz, tumble) => {
+    b.v[1] = power; b.v[0] += dx; b.v[2] += dz;
+    const a = Math.random() * 6.283;
+    b.w[0] += Math.cos(a) * tumble; b.w[2] += Math.sin(a) * tumble;
+    kick(b, 0, 1, 0, -power * 1.1);
+  };
+
+  // ---------- Idle: breathing all the time, and every few seconds one block hops ----------
+  let nextHop = 1.2, lastHopped = null;
+  const idle = (t) => {
+    for (const b of bodies) {
+      const br = (reduceMotion ? 0.008 : 0.016) * Math.sin(t * 1.7 + b.phase);
+      b.Er.fill(0); b.Er[0] = -br / 2; b.Er[4] = br; b.Er[8] = -br / 2;   // breathe: a little taller, a little thinner
+      if (b === held) {
+        // Hanging from the hand: the far side sags under gravity (the y row of E leans on the hand direction).
+        const l = Math.hypot(grabOffset[0], grabOffset[1], grabOffset[2]) || 1;
+        for (let k = 0; k < 3; k++) b.Er[3 + k] += (0.14 * grabOffset[k]) / l;
+      }
+      if (b.hopAt > 0 && t >= b.hopAt) {
+        b.hopAt = -1;
+        hop(b, reduceMotion ? 2.2 : 3.0 + Math.random() * 0.8, -b.c[0] * 0.3, -b.c[2] * 0.3, reduceMotion ? 0 : 2.5);
+      }
+    }
+    if (t < nextHop || held) return;
+    nextHop = t + (reduceMotion ? 10 + Math.random() * 6 : 3 + Math.random() * 2.5);
+    // Only a resting block with nothing on top hops, so the stack is not flung by the idle.
+    const carries = (b) => bodies.some((o) => o !== b && o.c[1] > b.c[1] && Math.hypot(o.c[0] - b.c[0], o.c[2] - b.c[2]) < b.h + o.h);
+    const ready = bodies.filter((b) => b.ground && b !== lastHopped && Math.hypot(...b.v) < 0.3 && !carries(b));
+    if (!ready.length) return;
+    const b = ready[(Math.random() * ready.length) | 0];
+    lastHopped = b; b.hopAt = t + 0.14;
+    kick(b, 0, 1, 0, 2.2);                                // anticipation: crouch before the jump
+  };
+
+  // ---------- Camera ----------
+  const { perspective, viewMatrices, orbitRig, rigPose } = scene;
+  const FOV = 32;
+  const projection = new Float32Array(16);
+  const pose = { position: new Float32Array(3), quaternion: new Float32Array(4) };
+  const view = { view: new Float32Array(16), viewProjection: new Float32Array(16) };
+  const rig = orbitRig({ target: [0, 0.45, 0.15], yaw: 0.6, pitch: 0.42, distance: 9 });
+  const cam = { viewProjection: view.viewProjection, eye: new Float32Array(4) };
+  const camSet = { camera: cam };
+  let aspect = 1, baseDistance = 9;
+  const resize = () => {
+    aspect = canvas.clientWidth / Math.max(1, canvas.clientHeight);
+    perspective({ fov: FOV, near: 0.1, far: 60 }, aspect, projection);
+    baseDistance = 7.0 / Math.min(1, aspect * 0.95);     // back off on narrow screens so the blocks fit
+    STAGE.x = aspect < 0.8 ? 1.8 : 2.4;                   // and narrow the stage so a throw stays in view
+  };
+  resize(); screen.onResize(resize);
+
+  // ---------- Pointer: ray from the camera, grab a block, drag it on a vertical plane, throw ----------
+  const ro = [0, 0, 0], rd = [0, 0, 0];
+  const rotateByPose = (x, y, z, out) => {                 // out = pose.quaternion * v
+    const q = pose.quaternion, tx = 2 * (q[1] * z - q[2] * y), ty = 2 * (q[2] * x - q[0] * z), tz = 2 * (q[0] * y - q[1] * x);
+    out[0] = x + q[3] * tx + (q[1] * tz - q[2] * ty); out[1] = y + q[3] * ty + (q[2] * tx - q[0] * tz); out[2] = z + q[3] * tz + (q[0] * ty - q[1] * tx);
+  };
+  const right = [0, 0, 0], up = [0, 0, 0], fwd = [0, 0, 0];
+  const pointerRay = (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const x = ((e.clientX - rect.left) / rect.width) * 2 - 1, y = 1 - ((e.clientY - rect.top) / rect.height) * 2;
+    const th = Math.tan((FOV * Math.PI) / 360);
+    rotateByPose(1, 0, 0, right); rotateByPose(0, 1, 0, up); rotateByPose(0, 0, -1, fwd);
+    for (let k = 0; k < 3; k++) { ro[k] = pose.position[k]; rd[k] = fwd[k] + right[k] * x * th * aspect + up[k] * y * th; }
+    const l = Math.hypot(...rd); rd[0] /= l; rd[1] /= l; rd[2] /= l;
+  };
+  // Ray against a block's box, in the block's own frame (slab test). Returns the distance or -1.
+  const rayBlock = (b) => {
+    const R = b.R, s = b.h * 1.08;
+    let tmin = 0, tmax = Infinity;
+    for (let k = 0; k < 3; k++) {
+      const o = (ro[0] - b.c[0]) * R[k * 3] + (ro[1] - b.c[1]) * R[k * 3 + 1] + (ro[2] - b.c[2]) * R[k * 3 + 2];
+      const d = rd[0] * R[k * 3] + rd[1] * R[k * 3 + 1] + rd[2] * R[k * 3 + 2];
+      if (Math.abs(d) < 1e-8) { if (Math.abs(o) > s) return -1; continue; }
+      let t0 = (-s - o) / d, t1 = (s - o) / d;
+      if (t0 > t1) [t0, t1] = [t1, t0];
+      tmin = Math.max(tmin, t0); tmax = Math.min(tmax, t1);
+      if (tmin > tmax) return -1;
+    }
+    return tmin;
+  };
+  const dragTo = () => {                                  // pointer ray against the drag plane, kept inside the stage
+    const den = rd[0] * planeN[0] + rd[2] * planeN[2];
+    if (Math.abs(den) < 1e-4) return;
+    const t = ((planeP[0] - ro[0]) * planeN[0] + (planeP[2] - ro[2]) * planeN[2]) / den;
+    if (t <= 0) return;
+    grabTarget[0] = Math.max(-STAGE.x, Math.min(STAGE.x, ro[0] + rd[0] * t));
+    grabTarget[1] = Math.max(0.05, Math.min(STAGE.top - 0.2, ro[1] + rd[1] * t));
+    grabTarget[2] = Math.max(-STAGE.z, Math.min(STAGE.z, ro[2] + rd[2] * t));
+  };
+  let clockNow = 0;
+  canvas.addEventListener("pointerdown", (e) => {
+    pointerRay(e);
+    let best = null, bestT = Infinity;
+    for (const b of bodies) { const t = rayBlock(b); if (t >= 0 && t < bestT) { best = b; bestT = t; } }
+    nextHop = Math.max(nextHop, clockNow + 4);
+    if (best) {
+      held = best; best.hopAt = -1; best.reboundIn = 0;
+      const R = best.R;
+      for (let k = 0; k < 3; k++) { planeP[k] = grabTarget[k] = ro[k] + rd[k] * bestT; grabOffset[k] = planeP[k] - best.c[k]; }
+      for (let k = 0; k < 3; k++) grabLocal[k] = grabOffset[0] * R[k * 3] + grabOffset[1] * R[k * 3 + 1] + grabOffset[2] * R[k * 3 + 2];
+      const fl = Math.hypot(fwd[0], fwd[2]); planeN[0] = fwd[0] / fl; planeN[1] = 0; planeN[2] = fwd[2] / fl;  // vertical, facing the camera
+      kick(best, 0, 1, 0, 1.5);                          // a squeeze as the hand closes
+      canvas.classList.add("holding");
+      try { canvas.setPointerCapture(e.pointerId); } catch {}  // keep the drag when the pointer leaves the canvas
+    } else if (rd[1] < 0) {
+      // Tap the floor: a thump that throws nearby blocks up and away from the tap.
+      const t = -ro[1] / rd[1], px = ro[0] + rd[0] * t, pz = ro[2] + rd[2] * t;
+      for (const b of bodies) {
+        const dx = b.c[0] - px, dz = b.c[2] - pz, dist = Math.hypot(dx, dz), s = Math.max(0, 1 - dist / 3.2);
+        if (s > 0 && b.ground) hop(b, 2 + 3.5 * s, (dx / (dist || 1)) * 1.2 * s, (dz / (dist || 1)) * 1.2 * s, reduceMotion ? 0 : 3 * s);
+      }
+    }
+  });
+  canvas.addEventListener("pointermove", (e) => { if (held) { pointerRay(e); dragTo(); } });
+  const release = () => {
+    if (!held) return;
+    const b = held; held = null; canvas.classList.remove("holding");
+    // Thrown things tumble forward: spin about (up x velocity).
+    b.w[0] += (b.v[2] * 0.3) / b.h; b.w[2] += (-b.v[0] * 0.3) / b.h;
+    nextHop = Math.max(nextHop, clockNow + 3);
+  };
+  canvas.addEventListener("pointerup", release);
+  canvas.addEventListener("pointercancel", release);
+
+  // ---------- Pack the GPU data ----------
+  const pack = () => {
+    for (let i = 0; i < COUNT; i++) {
+      const b = bodies[i], R = b.R, E = b.E, o = i * FLOATS;
+      // Pivot: the wobble squashes about the floor contact when grounded and about the hand when held,
+      // eased so it never jumps.
+      const sy = support(b, 0, 1, 0), gap = b.c[1] - sy;
+      let px = 0, py = -sy * Math.max(b.ground ? 1 : 0, 1 - Math.min(1, Math.max(0, gap) / (0.5 * b.h))), pz = 0;
+      if (b === held) { px = grabOffset[0]; py = grabOffset[1]; pz = grabOffset[2]; }
+      b.pivot[0] += (px - b.pivot[0]) * 0.25; b.pivot[1] += (py - b.pivot[1]) * 0.25; b.pivot[2] += (pz - b.pivot[2]) * 0.25;
+      // origin = centre - E * pivot, so the pivot point stays put while the rest deforms
+      for (let r = 0; r < 3; r++) packed[o + r] = b.c[r] - (E[r * 3] * b.pivot[0] + E[r * 3 + 1] * b.pivot[1] + E[r * 3 + 2] * b.pivot[2]);
+      // Columns of L = (I + E) * R * h
+      for (let k = 0; k < 3; k++) for (let r = 0; r < 3; r++) {
+        packed[o + 4 + k * 4 + r] = b.h * (R[k * 3 + r] + E[r * 3] * R[k * 3] + E[r * 3 + 1] * R[k * 3 + 1] + E[r * 3 + 2] * R[k * 3 + 2]);
+      }
+      // Normal matrix: columns (l1 x l2, l2 x l0, l0 x l1) = det * inverse transpose
+      for (let k = 0; k < 3; k++) {
+        const a = o + 4 + ((k + 1) % 3) * 4, c = o + 4 + ((k + 2) % 3) * 4, n = o + 16 + k * 4;
+        packed[n] = packed[a + 1] * packed[c + 2] - packed[a + 2] * packed[c + 1];
+        packed[n + 1] = packed[a + 2] * packed[c] - packed[a] * packed[c + 2];
+        packed[n + 2] = packed[a] * packed[c + 1] - packed[a + 1] * packed[c];
+      }
+      packed[o + 28] = b.color[0]; packed[o + 29] = b.color[1]; packed[o + 30] = b.color[2];
+      // Shape: bulge when squashed against the floor, and the half height the bulge is measured against.
+      const hy = Math.abs(packed[o + 5]) + Math.abs(packed[o + 9]) + Math.abs(packed[o + 13]);
+      packed[o + 32] = Math.max(0, -E[4]) * 0.7 * (b.ground ? 1 : 0.3); packed[o + 33] = Math.max(hy, 1e-3);
+      // Shadow footprint: the two box axes that lie flattest, projected on the floor.
+      let flat = 0; for (let k = 1; k < 3; k++) if (Math.abs(R[k * 3 + 1]) > Math.abs(R[flat * 3 + 1])) flat = k;
+      const a = (flat + 1) % 3, c = (flat + 2) % 3;
+      packed[o + 36] = packed[o + 4 + a * 4]; packed[o + 37] = packed[o + 6 + a * 4];
+      packed[o + 38] = packed[o + 4 + c * 4]; packed[o + 39] = packed[o + 6 + c * 4];
+      packed[o + 40] = b.c[0]; packed[o + 41] = b.c[2]; packed[o + 42] = gap;
+    }
+    blockBuffer.write(packed);
+  };
+
+  const time = clock(gpu);
+  const render = (pass) => { pass.draw(background); pass.draw(shadows); pass.draw(jelly); };
+  frameLoop(gpu, (frame) => {
+    const dt = Math.min(time.deltaTime, 1 / 30), t = time.time;
+    clockNow = t;
+    idle(t);
+    for (let s = 0; s < SUBSTEPS; s++) step(dt / SUBSTEPS);
+    // A slow sway so the studio never sits completely still.
+    rig.yaw = 0.6 + (reduceMotion ? 0 : 0.06 * Math.sin(t * 0.12));
+    rig.distance = baseDistance;
+    rigPose(rig, pose);
+    viewMatrices(pose, projection, view);
+    cam.eye[0] = pose.position[0]; cam.eye[1] = pose.position[1]; cam.eye[2] = pose.position[2];
+    pack();
+    shadows.set(camSet); jelly.set(camSet);
+    frame.pass(screen, render);
+  });
+})();
+</script>
+</body>
+</html>

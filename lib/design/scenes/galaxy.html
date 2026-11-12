@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Galaxy</title>
+<style>
+  :root { --bg: #060a12; --fg: #e9f7ff; --muted: #7d8da3; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); overflow: hidden; }
+  body { font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; cursor: crosshair; }
+  .hud { position: fixed; left: 20px; right: 20px; bottom: 18px; pointer-events: none; }
+  .hud h1 { margin: 0; font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
+  .hud p { margin: 2px 0 0; color: var(--muted); max-width: 34em; }
+  .fallback { position: fixed; inset: 0; display: none; place-items: center; padding: 24px; text-align: center; color: var(--muted); }
+</style>
+</head>
+<body>
+<canvas id="c" aria-label="A spiral galaxy of 200,000 stars. Move the pointer over it to bend the arms, tap for a shockwave."></canvas>
+<div class="hud"><h1>Galaxy</h1><p id="hint">Hover to bend the arms, hold to pull, tap for a shockwave. Drag off the disk, right-drag or use two fingers to orbit.</p></div>
+<div class="fallback" id="fallback">This scene needs WebGPU. Try a current Chrome, Edge or Safari.</div>
+<script>
+(async () => {
+  const { init, surface, target, compute, draw, storage, frameLoop, clock, prepareShader, scene } = vgpu;
+  const canvas = document.getElementById("c");
+  let gpu;
+  try { gpu = await init(); } catch { document.getElementById("fallback").style.display = "grid"; return; }
+
+  const COUNT = 200000, WG = 64;
+  const N_BULGE = 34000, N_HALO = 10000, N_GLOW = 12000; // the rest is the disk
+  const slow = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (matchMedia("(hover: none)").matches) document.getElementById("hint").textContent = "Touch the disk to pull the arms, tap for a shockwave. Drag off the disk or use two fingers to orbit.";
+
+  // Two render targets. Stars add up in a float (HDR) buffer, so 200k faint sprites accumulate
+  // without clipping or 8-bit banding; a final draw tone maps that light onto the canvas.
+  const screen = surface(gpu, canvas, { dpr: [1, 2], clearColor: [0.024, 0.039, 0.071, 1] });
+  const light = target(gpu, { size: screen.size, format: "rgba16float", label: "starlight" });
+
+  // Palette: "glacier" (ground #060a12, accent #6fcaff, highlight #e9f7ff) for space and young
+  // stars, paired with ember (#f2683c, #ffd2a1) for the old warm core and the dust lanes.
+  const background = draw(gpu, { label: "background", vertices: 3, cull: "none", depth: false, shader: prepareShader(`
+    struct BgOut { @builtin(position) clip: vec4f, @location(0) uv: vec2f }
+    @vertex fn vs_main(@builtin(vertex_index) i: u32) -> BgOut {
+      let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u)) * 2.0 - 1.0;      // fullscreen triangle
+      return BgOut(vec4f(p, 0.0, 1.0), p * 0.5 + 0.5);                  // uv.y = 1 at the top
+    }
+    @fragment fn fs_main(in: BgOut) -> @location(0) vec4f {
+      let uv = in.uv;
+      let top = pow(vec3f(0.055, 0.078, 0.125), vec3f(2.2)); let bottom = pow(vec3f(0.024, 0.039, 0.071), vec3f(2.2));
+      var c = mix(bottom, top, smoothstep(0.0, 1.0, uv.y));
+      let v = length((uv - vec2f(0.5, 0.55)) * vec2f(1.3, 1.0));
+      c *= 1.0 - 0.55 * smoothstep(0.35, 0.95, v);                       // vignette
+      c += (fract(sin(dot(uv * 913.0, vec2f(12.9898, 78.233))) * 43758.5453) - 0.5) * 0.012; // grain
+      return vec4f(pow(max(c, vec3f(0.0)), vec3f(1.0 / 2.2)), 1.0);
+    }
+  `) });
+
+  // ---- The stars -------------------------------------------------------------------------
+  // Every star has a fixed home orbit (Orbit, written once) and a displacement from it
+  // (Motion: offset + velocity, simulated). The galaxy itself is a pure function of time:
+  // disk stars ride ellipses whose tilt grows with radius, and where neighbouring ellipses
+  // crowd together the two spiral arms appear (the density-wave picture). Inner stars orbit
+  // faster than outer ones, yet the arms never wind up, because the pattern is in the orbits.
+  //   shape = (semi-major axis a, minor/major ratio, phase at t = 0, height above the plane)
+  //   look  = (kind: 0 disk, 1 bulge, 2 halo, 3 nebula glow; radius; brightness; random seed)
+  const GALAXY = `
+    struct Orbit { shape: vec4f, look: vec4f }
+    struct Motion { offset: vec4f, velocity: vec4f }
+    const PI: f32 = 3.14159265;
+    const TWIST: f32 = 2.6;            // how tightly the arms wind (log spiral)
+    const PATTERN: f32 = 0.025;        // the spiral pattern turns slowly as a whole (rad/s)
+    fn sq(x: f32) -> f32 { return x * x; }
+    fn omega(a: f32) -> f32 { return 0.2 / (a + 0.25); }   // flat-ish rotation curve
+    fn orbitAngle(o: Orbit, t: f32) -> f32 { return o.shape.z + omega(o.shape.x) * t; }
+    fn homeOf(o: Orbit, t: f32) -> vec3f {
+      let a = o.shape.x;
+      let th = orbitAngle(o, t);
+      let tilt = -TWIST * log(a + 0.05) + PATTERN * t;     // minus: trailing arms
+      let e = vec2f(a * cos(th), a * o.shape.y * sin(th));
+      let c = cos(tilt); let s = sin(tilt);
+      return vec3f(e.x * c - e.y * s, o.shape.w, e.x * s + e.y * c);
+    }
+  `;
+
+  // Seeded random numbers, so the galaxy looks the same on every load.
+  let seed = 7;
+  const rand = () => { seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  const gauss = () => Math.sqrt(-2 * Math.log(1 - rand())) * Math.cos(2 * Math.PI * rand());
+
+  const orbitData = new Float32Array(COUNT * 8);
+  const put = (i, a, squash, phase, y, kind, size, bright) => orbitData.set([a, squash, phase, y, kind, size, bright, rand()], i * 8);
+  const clusters = Array.from({ length: 700 }, () => [0.15 + 0.95 * Math.sqrt(rand()), rand() * Math.PI * 2]);
+  for (let i = 0; i < COUNT; i++) {
+    if (i < N_BULGE) {                                   // bulge: a flattened ball of old stars
+      const x = gauss() * 0.1, z = gauss() * 0.1;
+      put(i, Math.hypot(x, z) + 0.004, 1, Math.atan2(z, x), gauss() * 0.06, 1, 0.003, 1);
+    } else if (i < N_BULGE + N_HALO) {                   // halo: a faint, wide sphere
+      const x = gauss() * 0.75, z = gauss() * 0.75;
+      put(i, Math.hypot(x, z) + 0.05, 1, Math.atan2(z, x), gauss() * 0.4, 2, 0.003, 1);
+    } else if (i < N_BULGE + N_HALO + N_GLOW) {          // glow: big faint discs, brightest on the arms
+      put(i, 0.12 + rand() * 0.95, 0.86, rand() * Math.PI * 2, gauss() * 0.02, 3, 0.02 + rand() * 0.02, 1);
+    } else {                                             // disk: exponential, some in clusters
+      let a, phase;
+      if (rand() < 0.1) { const c = clusters[(rand() * clusters.length) | 0]; a = c[0] + gauss() * 0.008; phase = c[1] + gauss() * 0.03; }
+      else { do { a = 0.05 - 0.32 * Math.log(1 - rand()); } while (a > 1.25); phase = rand() * Math.PI * 2; }
+      const giant = rand() < 0.02;
+      // Inner orbits are near circles; the squash (and so the arms) grows outwards.
+      const squash = 1 - (0.12 + rand() * 0.05) * Math.min(1, Math.max(0, (a - 0.08) / 0.35));
+      const height = gauss() * 0.016 * (1 + 2 * Math.exp(-a / 0.15));          // thicker near the centre
+      put(i, a, squash, phase, height, 0, 0.003 * (0.8 + 0.4 * rand()) * (giant ? 2.5 : 1), giant ? 2 : 0.75 + 0.5 * rand());
+    }
+  }
+
+  // Brightness by density: the core holds far more stars per area than the rim, so a fixed
+  // brightness per star would sum to a white blob. Count stars per radial ring and give each
+  // star target(r) / density(r): the summed light then follows the profile we choose.
+  const BIN = 0.02, BINS = 70;
+  const DISC = 0.77;  // light under one exp(-4 r²) sprite, in units of its radius squared
+  const profile = {   // target surface brightness per kind, as a function of radius
+    star: (r) => (1.4 * Math.exp(-((r / 0.06) ** 2)) + 0.9 * Math.exp(-r / 0.13) + 0.45 * Math.exp(-r / 0.4)) * Math.min(1, Math.max(0, (1.25 - r) / 0.4)),
+    glow: (r) => 0.3 * Math.exp(-r / 0.45),
+  };
+  const normalize = (kinds, sb, refSize) => {
+    const counts = new Float32Array(BINS);
+    const binOf = (i) => Math.min(BINS - 1, (orbitData[i * 8] / BIN) | 0);
+    for (let i = 0; i < COUNT; i++) if (kinds.includes(orbitData[i * 8 + 4])) counts[binOf(i)]++;
+    for (let i = 0; i < COUNT; i++) {
+      if (!kinds.includes(orbitData[i * 8 + 4])) continue;
+      const b = binOf(i), area = Math.PI * BIN * BIN * (2 * b + 1);
+      const density = Math.max(counts[b], 1) / area;                 // stars per unit area
+      orbitData[i * 8 + 6] *= sb((b + 0.5) * BIN) / (density * DISC * refSize * refSize);
+    }
+  };
+  normalize([0, 1], profile.star, 0.003);
+  normalize([3], profile.glow, 0.03);
+  for (let i = N_BULGE; i < N_BULGE + N_HALO; i++) orbitData[i * 8 + 6] = 0.05;
+
+  const orbits = storage(gpu, orbitData.byteLength);
+  orbits.write(orbitData);
+  const motions = storage(gpu, COUNT * 32);              // starts at zero: every star at home
+  motions.write(new Float32Array(COUNT * 8));
+
+  // The simulation: each star's displacement from home is a damped spring, pushed by the
+  // pointer's gravity well (pull + swirl) and by the shockwave ring of a tap.
+  const step = compute(gpu, prepareShader(`
+    ${GALAXY}
+    struct Sim { well: vec4f, burst: vec4f, time: f32, dt: f32, spring: f32, damping: f32 }
+    @group(0) @binding(0) var<storage, read> orbits: array<Orbit>;
+    @group(0) @binding(1) var<storage, read_write> motions: array<Motion>;
+    @group(0) @binding(2) var<uniform> sim: Sim;
+    @compute @workgroup_size(${WG}) fn cs_main(@builtin(global_invocation_id) id: vec3u) {
+      let i = id.x;
+      if (i >= arrayLength(&motions)) { return; }
+      var off = motions[i].offset.xyz;
+      var vel = motions[i].velocity.xyz;
+      let p = homeOf(orbits[i], sim.time) + off;
+      var acc = -sim.spring * off - sim.damping * vel;   // pulled back to the home orbit
+
+      // Gravity well at the pointer (well.w = strength): a softened pull plus a swirl.
+      let d = sim.well.xyz - p;
+      let near = exp(-dot(d, d) / 0.05);                 // reach: about 0.22 of the 1.1 disk radius
+      let dir = d * inverseSqrt(dot(d, d) + 0.002);
+      acc += (dir * 3.0 + cross(vec3f(0.0, 1.0, 0.0), dir) * 2.2) * near * sim.well.w;
+
+      // Shockwave from a tap: a ring that expands from burst.xyz (burst.w = age in seconds)
+      // and fades with time and distance. Keep the kick well below the ring's speed, or
+      // stars surf the wave and the whole disk is blown out.
+      let age = sim.burst.w;
+      if (age < 1.0) {
+        let q = p - sim.burst.xyz;
+        let r = length(q.xz) + 1e-4;
+        let ring = exp(-sq((r - age * 0.9) / 0.06)) * sq(1.0 - age) * exp(-r * 2.5);
+        acc += vec3f(q.x / r, 0.3, q.z / r) * ring * 9.0;
+      }
+
+      vel += acc * sim.dt;                               // semi-implicit Euler
+      off += vel * sim.dt;
+      motions[i] = Motion(vec4f(off, 0.0), vec4f(vel, 0.0));
+    }
+  `), { label: "step", set: { orbits, motions } });
+
+  // Stars: one quad per star into the HDR target, a soft disc with exponential falloff,
+  // coloured by population. Disk stars light up blue-white as they pass through an arm and
+  // turn dim and red just before it (the dust lane on the arm's inner edge).
+  const stars = draw(gpu, {
+    label: "stars", vertices: 6, instances: COUNT, cull: "none", blend: "additive", depth: false,
+    shader: prepareShader(`
+      ${GALAXY}
+      struct View { viewProjection: mat4x4f, focal: f32, width: f32, height: f32, minRadius: f32, time: f32 }
+      @group(0) @binding(0) var<storage, read> orbits: array<Orbit>;
+      @group(0) @binding(1) var<storage, read> motions: array<Motion>;
+      @group(0) @binding(2) var<uniform> view: View;
+      struct Out { @builtin(position) clip: vec4f, @location(0) uv: vec2f, @location(1) color: vec3f }
+      fn lin(c: vec3f) -> vec3f { return pow(c, vec3f(2.2)); }
+      @vertex fn vs_main(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> Out {
+        var corner = array<vec2f, 6>(vec2f(-1,-1), vec2f(1,-1), vec2f(1,1), vec2f(-1,-1), vec2f(1,1), vec2f(-1,1));
+        let o = orbits[i];
+        let m = motions[i];
+        var out: Out;
+        let clip = view.viewProjection * vec4f(homeOf(o, view.time) + m.offset.xyz, 1.0);
+        if (clip.w < 0.05) { out.clip = vec4f(0.0, 0.0, -2.0, 1.0); return out; }   // behind the camera
+
+        let kind = o.look.x; let seedv = o.look.w;
+        let ember = lin(vec3f(0.949, 0.408, 0.235)); let warm = lin(vec3f(1.0, 0.824, 0.631));
+        let ice = lin(vec3f(0.435, 0.792, 1.0));      let white = lin(vec3f(0.914, 0.969, 1.0));
+        var color = mix(warm, white, 0.35);
+        var lum = o.look.z;
+        if (kind < 0.5 || kind > 2.5) {               // disk and glow: where is it relative to the arm?
+          let th = orbitAngle(o, view.time);
+          let ph = th - PI * round(th / PI);          // 0 at the arm crest, negative before it
+          let armed = smoothstep(0.1, 0.35, o.shape.x);    // no arms inside the bulge
+          let crest = exp(-sq((ph - 0.04) / 0.14)) * armed;
+          let dust = exp(-sq((ph + 0.17) / 0.1)) * armed;
+          let young = smoothstep(0.45, 1.0, seedv);
+          let blue = mix(ice, white, fract(seedv * 7.3) * 0.7);
+          if (kind < 0.5) {
+            color = mix(color, blue, crest * young);
+            color = mix(color, ember * vec3f(1.0, 0.75, 0.65), dust * 0.9);
+            lum *= (0.18 + crest * (0.6 + 3.6 * young)) * (1.0 - 0.5 * dust);
+          } else {
+            color = mix(color, mix(ice, white, 0.25), crest); // soft disk light, blue on the arms
+            lum *= (0.12 + crest * crest * 3.0) * (1.0 - 0.7 * dust);
+          }
+        } else if (kind < 1.5) {                      // bulge: old, warm
+          color = mix(warm, ember, 0.2 + 0.3 * seedv);
+        }
+        // Stars the pointer has displaced run hotter and whiter.
+        let heat = clamp(length(m.offset.xyz) * 4.0 + length(m.velocity.xyz) * 0.6, 0.0, 1.0);
+        color = mix(color, ice, heat * 0.6);
+        lum *= 1.0 + 0.8 * heat;
+
+        // Sprite radius in pixels. Below minRadius, grow to minRadius and dim to keep the
+        // same total light, so far stars do not shimmer as they cross pixels.
+        var px = o.look.y * view.focal * 0.5 * view.height / clip.w;
+        if (px < view.minRadius) { lum *= sq(px / view.minRadius); px = view.minRadius; }
+        out.clip = vec4f(clip.xy + corner[v] * px * 2.0 / vec2f(view.width, view.height) * clip.w, clip.zw);
+        out.uv = corner[v];
+        out.color = color * lum;
+        return out;
+      }
+      @fragment fn fs_main(in: Out) -> @location(0) vec4f {
+        let r2 = dot(in.uv, in.uv);
+        if (r2 > 1.0) { discard; }
+        return vec4f(in.color * exp(-r2 * 4.0), 0.0);
+      }
+    `),
+    set: { orbits, motions },
+  });
+
+  // Present: tone map the accumulated starlight (ACES, partly hue-preserving so the core
+  // stays warm instead of clipping to white), then gamma, added over the background.
+  const present = draw(gpu, {
+    label: "present", vertices: 3, cull: "none", blend: "additive", depth: false,
+    shader: prepareShader(`
+      @group(0) @binding(0) var light: texture_2d<f32>;
+      const EXPOSURE: f32 = 1.2;
+      @vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+        return vec4f(vec2f(f32((i << 1u) & 2u), f32(i & 2u)) * 2.0 - 1.0, 0.0, 1.0);
+      }
+      fn aces(x: vec3f) -> vec3f { return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), vec3f(0.0), vec3f(1.0)); }
+      @fragment fn fs_main(@builtin(position) frag: vec4f) -> @location(0) vec4f {
+        let hdr = textureLoad(light, vec2i(frag.xy), 0).rgb * EXPOSURE;
+        let lum = max(dot(hdr, vec3f(0.2126, 0.7152, 0.0722)), 1e-5);
+        let keepHue = hdr * (aces(vec3f(lum)).x / lum);
+        let c = mix(aces(hdr), min(keepHue, vec3f(1.0)), 0.5);
+        return vec4f(pow(c, vec3f(1.0 / 2.2)), 1.0);
+      }
+    `),
+    set: { light },
+  });
+
+  // ---- Camera ----------------------------------------------------------------------------
+  const { perspective, viewMatrices, orbitRig, rigPose } = scene;
+  const FOV = 35;
+  const projection = new Float32Array(16);
+  const pose = { position: new Float32Array(3), quaternion: new Float32Array(4) };
+  const matrices = { view: new Float32Array(16), viewProjection: new Float32Array(16) };
+  const portrait = innerHeight > innerWidth;          // tall screens: tilt more face-on to fill them
+  let yaw = 0.6, pitch = portrait ? 0.9 : 0.55, vyaw = 0, vpitch = 0, dragYaw = 0, dragPitch = 0;
+  let zoom = 1, fitDistance = 4, aspect = 1;
+  const rig = orbitRig({ yaw, pitch, distance: 4 });
+  const viewParams = { viewProjection: matrices.viewProjection, focal: 1, width: 1, height: 1, minRadius: 1.4, time: 0 };
+  screen.onResize(({ width, height, dpr }) => {
+    light.resize([width, height]);
+    aspect = width / height;
+    perspective({ fov: FOV, near: 0.05, far: 100 }, aspect, projection);
+    // Fit the disk (radius ~1.1) to the viewport: by width on phones, by height on desktops.
+    const t = Math.tan(FOV * Math.PI / 360);
+    fitDistance = Math.max(1.1 / (0.96 * t * aspect), 0.75 / (0.8 * t));
+    Object.assign(viewParams, { focal: projection[5], width, height, minRadius: 1.0 * dpr });
+  });
+
+  // The camera ray through a pointer position, intersected with the galaxy plane y = 0.
+  const hit = new Float32Array(3);
+  const pick = (clientX, clientY) => {
+    const t = Math.tan(FOV * Math.PI / 360);
+    const x = (clientX / canvas.clientWidth * 2 - 1) * t * aspect, y = (1 - clientY / canvas.clientHeight * 2) * t, z = -1;
+    const [qx, qy, qz, qw] = pose.quaternion;          // rotate (x, y, z) by the camera's rotation
+    const tx = 2 * (qy * z - qz * y), ty = 2 * (qz * x - qx * z), tz = 2 * (qx * y - qy * x);
+    const dx = x + qw * tx + (qy * tz - qz * ty), dy = y + qw * ty + (qz * tx - qx * tz), dz = z + qw * tz + (qx * ty - qy * tx);
+    const s = -pose.position[1] / dy;
+    if (!(s > 0)) return false;
+    hit[0] = pose.position[0] + dx * s; hit[1] = 0; hit[2] = pose.position[2] + dz * s;
+    return true;
+  };
+  const onDisk = (x, y) => pick(x, y) && Math.hypot(hit[0], hit[2]) < 1.3;
+
+  // ---- Pointer ---------------------------------------------------------------------------
+  // Over the disk the pointer is a gravity well: hover bends, press pulls hard. A press
+  // that starts off the disk, a right-button drag or a second finger orbits the camera.
+  const well = new Float32Array(4);                    // xyz on the plane, w = strength
+  const burst = new Float32Array([0, 0, 0, 9]);        // xyz = tap point, w = age in seconds
+  const pointers = new Map();
+  let mode = "none", hovering = false, px = 0, py = 0, downX = 0, downY = 0, downTime = 0;
+  canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+  canvas.addEventListener("pointerdown", (e) => {
+    pointers.set(e.pointerId, [e.clientX, e.clientY]);
+    px = e.clientX; py = e.clientY; downX = px; downY = py; downTime = performance.now(); hovering = true;
+    mode = pointers.size > 1 || e.button === 2 || !onDisk(px, py) ? "orbit" : "well";
+    canvas.setPointerCapture(e.pointerId);
+  });
+  canvas.addEventListener("pointermove", (e) => {
+    const last = pointers.get(e.pointerId);
+    if (mode === "orbit" && last) {
+      const share = 1 / pointers.size;                 // two fingers: each contributes half
+      dragYaw -= (e.clientX - last[0]) * 0.006 * share; dragPitch += (e.clientY - last[1]) * 0.004 * share;
+    }
+    if (last) { last[0] = e.clientX; last[1] = e.clientY; }
+    if (pointers.size <= 1) { px = e.clientX; py = e.clientY; hovering = true; }
+  });
+  const release = (e) => {
+    pointers.delete(e.pointerId);
+    const tap = mode === "well" && Math.hypot(e.clientX - downX, e.clientY - downY) < 8 && performance.now() - downTime < 350;
+    if (tap && onDisk(e.clientX, e.clientY)) { burst[0] = hit[0]; burst[1] = 0; burst[2] = hit[2]; burst[3] = 0; }
+    if (pointers.size === 0) mode = "none";
+    if (e.pointerType !== "mouse") hovering = false;   // touch has no hover
+  };
+  canvas.addEventListener("pointerup", release);
+  canvas.addEventListener("pointercancel", release);
+  canvas.addEventListener("pointerleave", (e) => { if (e.pointerType === "mouse" && pointers.size === 0) hovering = false; });
+  canvas.addEventListener("wheel", (e) => { e.preventDefault(); zoom = Math.min(1.8, Math.max(0.45, zoom * Math.exp(e.deltaY * 0.001))); }, { passive: false });
+
+  // ---- Frame loop ------------------------------------------------------------------------
+  const sim = { well, burst, time: 0, dt: 0, spring: 2.25, damping: 2.4 };
+  const simBag = { sim }, viewBag = { view: viewParams };
+  const ease = (from, to, rate, dt) => from + (to - from) * (1 - Math.exp(-rate * dt));
+  const time = clock(gpu);
+  frameLoop(gpu, (frame) => {
+    const dt = Math.min(time.deltaTime, 1 / 30);
+    sim.time += dt * (slow ? 0.3 : 1);                 // galaxy clock; reduced motion turns slower
+    sim.dt = dt;
+
+    // Camera: while orbiting, this frame's drag is the velocity; after release it coasts.
+    if (mode === "orbit") { vyaw = dragYaw; vpitch = dragPitch; } else { vyaw *= 0.93; vpitch *= 0.93; }
+    dragYaw = 0; dragPitch = 0;
+    yaw += vyaw; pitch = Math.min(1.45, Math.max(0.08, pitch + vpitch));
+    rig.yaw = yaw; rig.pitch = pitch; rig.distance = fitDistance * zoom;
+    rigPose(rig, pose);
+    viewMatrices(pose, projection, matrices);
+
+    // Gravity well: follow the pointer; strength eases in and out so nothing pops.
+    const active = hovering && mode !== "orbit" && pick(px, py) && Math.hypot(hit[0], hit[2]) < 1.5;
+    if (active) { well[0] = hit[0]; well[1] = 0; well[2] = hit[2]; }
+    const held = mode === "well";
+    well[3] = ease(well[3], active ? (held ? 1.4 : 0.16) : 0, 8, dt);
+    sim.spring = ease(sim.spring, held ? 0.5 : 2.25, held ? 6 : 3, dt);
+    sim.damping = ease(sim.damping, held ? 1.1 : 2.4, 6, dt);
+    burst[3] += dt;
+
+    viewParams.time = sim.time;
+    step.set(simBag);
+    stars.set(viewBag);
+    frame.computePass((pass) => pass.dispatch(step, Math.ceil(COUNT / WG)));
+    frame.pass({ target: light, clear: [0, 0, 0, 0] }, (pass) => pass.draw(stars));
+    frame.pass(screen, (pass) => { pass.draw(background); pass.draw(present); });
+  });
+})();
+</script>
+</body>
+</html>

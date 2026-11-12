@@ -105,7 +105,7 @@ preview        <iframe sandbox="allow-scripts" src="/preview-frame">  (opaque or
 | --- | --- | --- |
 | `NEXT_PUBLIC_HANKO_API_URL` | all | radian.sh's Hanko API, `https://auth.radian.sh` |
 | `HANKO_SERVER_API_URL` | optional | Validate sessions against another Hanko API (tests only) |
-| `AI_GATEWAY_MODEL` | optional | Default `anthropic/claude-haiku-5.5`; the composer shows it |
+| `AI_GATEWAY_MODEL` | optional | Default `anthropic/claude-sonnet-5.5`; the composer shows it |
 | `FREE_PROMPTS` | optional | Free prompts a new account gets. Default 1 |
 | `AI_GATEWAY_API_KEY` | optional | Leave unset on Vercel to use the project's OIDC token |
 | `VERCEL_OIDC_TOKEN` | local | Written by `vercel env pull`; on Vercel it comes with each request |

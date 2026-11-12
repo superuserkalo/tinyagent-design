@@ -1,8 +1,8 @@
 // The scene skill: how the agent builds WebGPU pieces with vgpu. A condensed reference for
 // the vgpu version bundled into the design frame (scripts/build-scene-assets.mjs), written
-// from that version's own docs, plus a worked example that is known to run. Kept apart from
+// from that version's own docs, plus hand-tested starter scenes the agent adapts. Kept apart from
 // the operating rules in lib/agent.ts so it can be tuned on its own. Plain text, read by the model.
-import { EXAMPLE_SCENE } from "./example-scene.ts";
+import { STARTER_SCENES } from "./starter-scenes.ts";
 import { VGPU_VERSION } from "../vgpu-version.ts";
 
 export const DESIGN_BRIEF = `# Scene brief
@@ -42,7 +42,7 @@ const { init, surface, effect, draw, compute, storage, pingPongStorage, geometry
 
 ## 3. Physics that looks right
 - Integrate on the GPU: semi-implicit Euler (velocity += accel * dt; position += velocity * dt), damping 0.98 to 0.999 per step, walls that reflect with restitution 0.2 to 0.5. Run 1 to 4 substeps per frame for stiff systems.
-- Particles that should take up space (liquid, sand, crowds) need pressure, or they collapse into a corner: clear a density grid, atomicAdd every particle into its cell, and push each particle down the density gradient (the example does exactly this).
+- Particles that should take up space (liquid, sand, crowds) need pressure, or they collapse into a corner: clear a density grid, atomicAdd every particle into its cell, and push each particle down the density gradient (the liquid-cube starter does exactly this).
 - Cloth and soft bodies: a grid of points with distance constraints (Verlet or position-based dynamics), solved a few iterations per frame with ping-pong buffers; render as a mesh or lines.
 - Fields and flocks: curl noise, attractors at the pointer, alignment and separation from a neighbour grid.
 - Rigid toys (blocks, balls you throw): few enough bodies to simulate in plain JavaScript; render them instanced.
@@ -102,7 +102,7 @@ Never: unlit flat colour on a mesh, beige or brown mud, rainbow hue cycling, eve
 ## 6. Before publishing
 Check in your head: every WGSL binding is set; every shader went through prepareShader; struct layouts in WGSL match what the JavaScript sets; workgroup counts cover every element; the vertex shader declares exactly the mesh's attributes; the scene is visible and beautiful from the first frame without input (background pass, palette, tone mapping, idle motion); the fallback shows when WebGPU is missing; the document is under 60 KB.
 
-## 7. Worked example (runs as written)
-A glass cube of 32,768 particles that slosh like liquid as you drag the cube around. Reuse its structure: init with fallback, buffers, kernels, draws, camera, pointer, frameLoop.
+## 7. Starter scenes (hand-tested; adapt one, do not start from zero)
+These run as written and follow the look kit. Begin every new scene from the closest starter: keep its working skeleton (init and fallback, buffers, kernels, draws, camera, pointer, background pass, tone mapping) and change the subject, palette, physics and interaction to fit the request. Combine parts of several when the request mixes ideas. Write from scratch only when none is close, and then still copy their structure and conventions. Say which starter you began from in your first sentence only if it helps the user.
 
-${EXAMPLE_SCENE}`;
+${STARTER_SCENES.map((scene) => `### Starter: ${scene.title} (${scene.name})\n\n${scene.html}`).join("\n\n")}`;

@@ -1,0 +1,519 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Silk Cloth</title>
+<style>
+  :root { --bg: #0c0a0b; --fg: #fff0ea; --muted: #9a8a8c; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); overflow: hidden; }
+  body { font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; cursor: grab; }
+  canvas:active { cursor: grabbing; }
+  .hud { position: fixed; left: 20px; bottom: 18px; right: 20px; pointer-events: none; }
+  .hud h1 { margin: 0; font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
+  .hud p { margin: 2px 0 0; color: var(--muted); }
+  .hud button { pointer-events: auto; font: inherit; color: var(--fg); background: none; border: 0; padding: 0;
+                margin-left: 4px; cursor: pointer; text-decoration: underline; text-underline-offset: 3px;
+                text-decoration-color: rgba(229, 154, 164, 0.6); }
+  .hud button:hover { text-decoration-color: currentColor; }
+  .fallback { position: fixed; inset: 0; display: none; place-items: center; padding: 24px; text-align: center; color: var(--muted); }
+</style>
+</head>
+<body>
+<canvas id="c" aria-label="A sheet of silk hanging from two pins. Drag it to pull it; pull hard and it tears."></canvas>
+<div class="hud"><h1>Silk</h1><p>Drag to pull the silk. Pull hard and it tears. <button id="rehang" type="button">Rehang</button> (R, or double-tap)</p></div>
+<div class="fallback" id="fallback">This scene needs WebGPU. Try a current Chrome, Edge or Safari.</div>
+<script>
+(async () => {
+  const { init, surface, compute, draw, storage, uniforms, frameLoop, clock, prepareShader, scene } = vgpu;
+  const canvas = document.getElementById("c");
+  let gpu;
+  try { gpu = await init(); } catch { document.getElementById("fallback").style.display = "grid"; return; }
+
+  // The cloth: an N x N grid of particles, row 0 at the top. Particle i = y * N + x.
+  const N = 96, COUNT = N * N, WG = 64, GROUPS = Math.ceil(COUNT / WG);
+  const SIZE = 2.0, REST = SIZE / (N - 1);   // sheet edge length and the rest length of one link
+  const PIN_SPAN = 0.8;                      // pins sit closer than the sheet is wide, so it drapes in folds
+  const TOP = 1.05;                          // height of the pins
+  const SUB = 20, ITER = 3;                  // substeps per frame; Jacobi iterations per substep (odd: see frameLoop)
+  const OMEGA = 3.0;                         // over-relaxation of the weighted Jacobi average (unstable above ~4)
+  const TEAR = 1.9;                          // a link breaks when stretched past this multiple of its rest length
+  const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const screen = surface(gpu, canvas, { dpr: [1, 2], depth: true, msaa: true, clearColor: [0.047, 0.039, 0.043, 1] });
+
+  // Palette "rose metal": ground #0c0a0b, accent #e59aa4, highlight #fff0ea.
+  const background = draw(gpu, { label: "background", vertices: 3, cull: "none", depth: { write: false, compare: "always" }, shader: prepareShader(`
+    struct BgOut { @builtin(position) clip: vec4f, @location(0) uv: vec2f }
+    @vertex fn vs_main(@builtin(vertex_index) i: u32) -> BgOut {
+      let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u)) * 2.0 - 1.0;      // fullscreen triangle
+      return BgOut(vec4f(p, 0.0, 1.0), p * 0.5 + 0.5);                  // uv.y = 1 at the top
+    }
+    @fragment fn fs_main(in: BgOut) -> @location(0) vec4f {
+      let uv = in.uv;
+      let top = pow(vec3f(0.13, 0.1, 0.11), vec3f(2.2)); let bottom = pow(vec3f(0.047, 0.039, 0.043), vec3f(2.2)); // two shades of the ground colour
+      var c = mix(bottom, top, smoothstep(0.0, 1.0, uv.y));
+      let v = length((uv - vec2f(0.5, 0.55)) * vec2f(1.3, 1.0));
+      c *= 1.0 - 0.55 * smoothstep(0.35, 0.95, v);                       // vignette
+      c += (fract(sin(dot(uv * 913.0, vec2f(12.9898, 78.233))) * 43758.5453) - 0.5) * 0.012; // grain
+      return vec4f(pow(c, vec3f(1.0 / 2.2)), 1.0);
+    }
+  `) });
+
+  // ---- State -------------------------------------------------------------------------------
+  // pos: xyz + inverse mass (0 = pinned). Two buffers, A and B: a kernel reads one and writes the
+  // other, so no buffer is ever bound twice with write access. Every frame ends with the state in A.
+  // prev: last position, for Verlet (velocity = pos - prev).
+  // links: per particle, 4 bits for the links it owns: 1 right, 2 down, 4 down-right, 8 down-left.
+  // grab: the picked particle, written on the GPU (no readback): key (packed score|index), index, depth.
+  const seed = new Float32Array(COUNT * 4);
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+    const i = (y * N + x) * 4;
+    seed[i] = (x / (N - 1) - 0.5) * SIZE * PIN_SPAN; // starts level, reaching back from the pins
+    seed[i + 1] = TOP + (Math.random() - 0.5) * 0.004;
+    seed[i + 2] = -y * REST;
+    seed[i + 3] = y === 0 && (x === 0 || x === N - 1) ? 0 : 1;
+  }
+  const allLinks = new Uint32Array(COUNT).fill(15);
+  const NONE = 0xffffffff, noGrab = new Uint32Array([NONE, NONE, 0, 0]);
+  const posA = storage(gpu, seed.byteLength), posB = storage(gpu, seed.byteLength), prev = storage(gpu, seed.byteLength);
+  const links = storage(gpu, allLinks.byteLength), grab = storage(gpu, 16);
+  const hang = () => { posA.write(seed); prev.write(seed); links.write(allLinks); grab.write(noGrab); };
+  hang();
+
+  // One uniform block shared by every kernel. step: x substep dt, y time, z wind, w tear ratio (0 = off).
+  // rayO: camera position, w = 1 while dragging. rayD: pointer ray direction, w = pick radius.
+  const simValues = { step: [0, 0, 0, 0], rayO: [0, 0, 0, 0], rayD: [0, 0, -1, 0.1] };
+  const sim = uniforms(gpu, simValues);
+
+  const COMMON = `
+    const N: i32 = ${N};
+    const REST: f32 = ${REST};
+    const NONE: u32 = 0xffffffffu;
+    struct Sim { step: vec4f, rayO: vec4f, rayD: vec4f }
+    struct Grab { key: u32, index: u32, depth: f32, pad: f32 }
+    fn cellOf(i: u32) -> vec2i { return vec2i(i32(i) % N, i32(i) / N); }
+    fn inGrid(c: vec2i) -> bool { return all(c >= vec2i(0)) && all(c < vec2i(N)); }
+    fn idx(c: vec2i) -> u32 { return u32(c.y * N + c.x); }
+  `;
+  // Link lookup; needs a \`links\` binding. A link is stored on the endpoint it leaves rightwards or downwards.
+  const LINKS = `
+    fn linkOk(c: vec2i, d: vec2i) -> bool {                // the single link from c to c + d, |d| <= 1
+      var a = c; var o = d;
+      if (d.y < 0 || (d.y == 0 && d.x < 0)) { a = c + d; o = -d; }
+      if (!inGrid(a) || !inGrid(a + o)) { return false; }
+      let bit = select(select(select(3u, 2u, o.x == 1), 1u, o.x == 0), 0u, o.y == 0);
+      return (links[idx(a)] & (1u << bit)) != 0u;
+    }
+    fn intact(c: vec2i, d: vec2i) -> bool {                // bend links (two apart) need both halves
+      if (abs(d.x) == 2 || abs(d.y) == 2) { let s = d / 2; return linkOk(c, s) && linkOk(c + s, s); }
+      return linkOk(c, d);
+    }
+  `;
+  // While dragging, the 5x5 patch around the picked particle follows the pointer ray (a pinch of cloth).
+  const HELD = `
+    fn held(c: vec2i) -> bool {
+      if (sim.rayO.w < 0.5 || grab.index == NONE) { return false; }
+      let d = abs(c - cellOf(grab.index));
+      return max(d.x, d.y) <= 2;
+    }
+  `;
+
+  // Picking, on the GPU: every particle near the pointer ray offers (depth + 4 x distance from the ray)
+  // packed above its index; atomicMin keeps the best. Runs only on the frame of a pointerdown.
+  const pick = compute(gpu, prepareShader(`
+    ${COMMON}
+    struct GrabPick { key: atomic<u32>, index: u32, depth: f32, pad: f32 }
+    @group(0) @binding(0) var<storage, read> pos: array<vec4f>;
+    @group(0) @binding(1) var<storage, read> links: array<u32>;
+    @group(0) @binding(2) var<storage, read_write> grab: GrabPick;
+    @group(0) @binding(3) var<uniform> sim: Sim;
+    ${LINKS}
+    @compute @workgroup_size(${WG}) fn cs_main(@builtin(global_invocation_id) id: vec3u) {
+      if (id.x >= arrayLength(&pos)) { return; }
+      let c = cellOf(id.x);
+      if (!(linkOk(c, vec2i(1, 0)) || linkOk(c, vec2i(-1, 0)) || linkOk(c, vec2i(0, 1)) || linkOk(c, vec2i(0, -1)))) { return; }
+      let v = pos[id.x].xyz - sim.rayO.xyz;
+      let t = dot(v, sim.rayD.xyz);
+      let off = length(v - sim.rayD.xyz * t);
+      if (t <= 0.0 || off > sim.rayD.w) { return; }
+      let score = min(u32((t + off * 4.0) * 4096.0), 0x3ffffu);   // 18 bits of score, 14 bits of index (N <= 128)
+      atomicMin(&grab.key, (score << 14u) | id.x);
+    }
+  `), { label: "pick", set: { pos: posA, links, grab, sim } });
+  const resolve = compute(gpu, prepareShader(`
+    ${COMMON}
+    @group(0) @binding(0) var<storage, read> pos: array<vec4f>;
+    @group(0) @binding(1) var<storage, read_write> grab: Grab;
+    @group(0) @binding(2) var<uniform> sim: Sim;
+    @compute @workgroup_size(1) fn cs_main() {
+      if (grab.key == NONE) { grab.index = NONE; return; }
+      grab.index = grab.key & 0x3fffu;
+      grab.depth = dot(pos[grab.index].xyz - sim.rayO.xyz, sim.rayD.xyz);   // keep this depth along the ray
+    }
+  `), { label: "resolve", set: { pos: posA, grab, sim } });
+
+  // Verlet step: gravity, a breeze pushing on the sheet along its normal, air drag. Reads A, writes B.
+  const integrate = compute(gpu, prepareShader(`
+    ${COMMON}
+    @group(0) @binding(0) var<storage, read> src: array<vec4f>;
+    @group(0) @binding(1) var<storage, read_write> dst: array<vec4f>;
+    @group(0) @binding(2) var<storage, read_write> prev: array<vec4f>;
+    @group(0) @binding(3) var<storage, read> links: array<u32>;
+    @group(0) @binding(4) var<storage, read> grab: Grab;
+    @group(0) @binding(5) var<uniform> sim: Sim;
+    ${LINKS}
+    ${HELD}
+    fn nb(c: vec2i, d: vec2i, p: vec3f) -> vec3f { if (intact(c, d)) { return src[idx(c + d)].xyz; } return p; }
+    fn breeze(p: vec3f, t: f32) -> vec3f {
+      let gust = 0.55 + 0.45 * sin(t * 0.61 + p.x * 0.9) * sin(t * 0.37 + p.y * 1.3 + 1.7);
+      let flutter = 0.25 * sin(t * 2.3 + p.x * 3.1 + p.y * 2.3);
+      return normalize(vec3f(0.55 * sin(t * 0.21), 0.05, 1.0)) * (gust + flutter) * sim.step.z;
+    }
+    @compute @workgroup_size(${WG}) fn cs_main(@builtin(global_invocation_id) id: vec3u) {
+      let i = id.x;
+      if (i >= arrayLength(&src)) { return; }
+      let p = src[i];
+      let c = cellOf(i);
+      if (p.w == 0.0) { dst[i] = p; prev[i] = p; return; }                    // pinned
+      let dt = sim.step.x;
+      if (held(c)) {                                                          // dragged: follow the ray, speed-limited
+        let goal = sim.rayO.xyz + sim.rayD.xyz * grab.depth;
+        var shift = (goal - src[grab.index].xyz) * 0.25;                    // ease toward the pointer...
+        let len = length(shift);
+        if (len > 0.006) { shift *= 0.006 / len; }                            // ...at a bounded speed
+        dst[i] = vec4f(p.xyz + shift, p.w); prev[i] = p;
+        return;
+      }
+      let v = p.xyz - prev[i].xyz;                                            // displacement over the last substep
+      var n = cross(nb(c, vec2i(0, 1), p.xyz) - nb(c, vec2i(0, -1), p.xyz), nb(c, vec2i(1, 0), p.xyz) - nb(c, vec2i(-1, 0), p.xyz));
+      n *= inverseSqrt(max(dot(n, n), 1e-12));
+      let air = breeze(p.xyz, sim.step.y) - v / max(dt, 1e-5);                 // wind relative to the cloth
+      let a = vec3f(0.0, -9.8, 0.0) + n * dot(n, air) * 3.0;                  // silk is light: air moves it a lot
+      var x = p.xyz + v * 0.998 + a * dt * dt;
+      x.y = max(x.y, -3.0);                                                   // a floor far below, for torn scraps
+      dst[i] = vec4f(x, p.w);
+      prev[i] = p;
+    }
+  `), { label: "integrate", set: { src: posA, dst: posB, prev, links, grab, sim } });
+
+  // Distance constraints, Jacobi style: each particle reads its 12 neighbours (structural, shear, bend)
+  // from one buffer and writes its averaged correction to the other. Two instances: B->A and A->B.
+  const SOLVE = prepareShader(`
+    ${COMMON}
+    @group(0) @binding(0) var<storage, read> src: array<vec4f>;
+    @group(0) @binding(1) var<storage, read_write> dst: array<vec4f>;
+    @group(0) @binding(2) var<storage, read> links: array<u32>;
+    @group(0) @binding(3) var<storage, read> grab: Grab;
+    @group(0) @binding(4) var<uniform> sim: Sim;
+    ${LINKS}
+    ${HELD}
+    @compute @workgroup_size(${WG}) fn cs_main(@builtin(global_invocation_id) id: vec3u) {
+      let i = id.x;
+      if (i >= arrayLength(&src)) { return; }
+      let p = src[i];
+      let c = cellOf(i);
+      if (p.w == 0.0 || held(c)) { dst[i] = p; return; }
+      var offs = array<vec2i, 12>(vec2i(1, 0), vec2i(-1, 0), vec2i(0, 1), vec2i(0, -1),
+                                  vec2i(1, 1), vec2i(-1, -1), vec2i(-1, 1), vec2i(1, -1),
+                                  vec2i(2, 0), vec2i(-2, 0), vec2i(0, 2), vec2i(0, -2));
+      var corr = vec3f(0.0);
+      var weight = 0.0;
+      for (var k = 0; k < 12; k++) {
+        let d = offs[k];
+        if (!intact(c, d)) { continue; }
+        let q = src[idx(c + d)];
+        let wq = select(q.w, 0.0, held(c + d));
+        let e = q.xyz - p.xyz;
+        let len = length(e);
+        if (len < 1e-7) { continue; }
+        let stiff = select(1.0, 0.4, k >= 8);                                 // bend links are softer: silk drapes
+        corr += stiff * p.w / (p.w + wq) * (len - length(vec2f(d)) * REST) / len * e;
+        weight += stiff;
+      }
+      var delta = corr * (${OMEGA} / max(weight, 1.0));                       // over-relaxed average
+      let size = length(delta);
+      if (size > REST * 0.5) { delta *= REST * 0.5 / size; }                  // never jump more than half a link
+      dst[i] = vec4f(p.xyz + delta, p.w);
+    }
+  `);
+  const solveBA = compute(gpu, SOLVE, { label: "solveBA", set: { src: posB, dst: posA, links, grab, sim } });
+  const solveAB = compute(gpu, SOLVE, { label: "solveAB", set: { src: posA, dst: posB, links, grab, sim } });
+
+  // Tearing: each particle checks the 4 links it owns and clears the bits of the overstretched ones.
+  const tear = compute(gpu, prepareShader(`
+    ${COMMON}
+    @group(0) @binding(0) var<storage, read> pos: array<vec4f>;
+    @group(0) @binding(1) var<storage, read_write> links: array<u32>;
+    @group(0) @binding(2) var<uniform> sim: Sim;
+    @compute @workgroup_size(${WG}) fn cs_main(@builtin(global_invocation_id) id: vec3u) {
+      let i = id.x;
+      if (i >= arrayLength(&pos) || sim.step.w <= 0.0) { return; }
+      var bits = links[i];
+      let c = cellOf(i);
+      // The pins carry the whole sheet, so the cloth around them is reinforced: rips start in the cloth.
+      if (min(max(c.x, c.y), max(N - 1 - c.x, c.y)) < 9) { return; }
+      let limit = REST * sim.step.w;
+      var dirs = array<vec2i, 4>(vec2i(1, 0), vec2i(0, 1), vec2i(1, 1), vec2i(-1, 1));
+      for (var b = 0u; b < 4u; b++) {
+        let o = c + dirs[b];
+        if ((bits & (1u << b)) == 0u || !inGrid(o)) { continue; }
+        let flaw = fract(sin(f32(i * 4u + b) * 12.9898) * 43758.5453);          // uneven weave: rips wander
+        if (distance(pos[i].xyz, pos[idx(o)].xyz) > length(vec2f(dirs[b])) * limit * (0.85 + 0.3 * flaw)) { bits &= ~(1u << b); }
+      }
+      links[i] = bits;
+    }
+  `), { label: "tear", set: { pos: posA, links, sim } });
+
+  // Shading data per particle, once per frame: normal + fray in [2i], thread tangent in [2i + 1].
+  // Fray is the share of a particle's links that are broken (cloth borders do not count).
+  const surf = storage(gpu, COUNT * 32);
+  const shading = compute(gpu, prepareShader(`
+    ${COMMON}
+    @group(0) @binding(0) var<storage, read> pos: array<vec4f>;
+    @group(0) @binding(1) var<storage, read> links: array<u32>;
+    @group(0) @binding(2) var<storage, read_write> surf: array<vec4f>;
+    ${LINKS}
+    fn nb(c: vec2i, d: vec2i, p: vec3f) -> vec3f { if (linkOk(c, d)) { return pos[idx(c + d)].xyz; } return p; }
+    @compute @workgroup_size(${WG}) fn cs_main(@builtin(global_invocation_id) id: vec3u) {
+      if (id.x >= arrayLength(&pos)) { return; }
+      let c = cellOf(id.x);
+      let p = pos[id.x].xyz;
+      let dx = nb(c, vec2i(1, 0), p) - nb(c, vec2i(-1, 0), p);
+      let dy = nb(c, vec2i(0, 1), p) - nb(c, vec2i(0, -1), p);
+      var dirs = array<vec2i, 8>(vec2i(1, 0), vec2i(-1, 0), vec2i(0, 1), vec2i(0, -1), vec2i(1, 1), vec2i(-1, -1), vec2i(-1, 1), vec2i(1, -1));
+      var broken = 0.0; var total = 0.0;
+      for (var j = 0; j < 8; j++) {
+        if (!inGrid(c + dirs[j])) { continue; }
+        total += 1.0;
+        if (!linkOk(c, dirs[j])) { broken += 1.0; }
+      }
+      let n = cross(dy, dx);                                                 // points out of the front (+z) side
+      surf[id.x * 2u] = vec4f(n * inverseSqrt(max(dot(n, n), 1e-12)), broken / max(total, 1.0));
+      surf[id.x * 2u + 1u] = vec4f(dx * inverseSqrt(max(dot(dx, dx), 1e-12)), 0.0);
+    }
+  `), { label: "surface", set: { pos: posA, links, surf } });
+
+  // ---- Drawing -----------------------------------------------------------------------------
+  const camera = uniforms(gpu, { viewProjection: new Float32Array(16), eye: [0, 0, 5, 1], right: [1, 0, 0, 0], up: [0, 1, 0, 0] });
+  const LOOK = `
+    struct Camera { viewProjection: mat4x4f, eye: vec4f, right: vec4f, up: vec4f }
+    fn aces(x: vec3f) -> vec3f { return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), vec3f(0.0), vec3f(1.0)); }
+    const KEY = vec3f(-0.4851, 0.7761, 0.4366);                               // normalize(-0.5, 0.8, 0.45)
+    fn shade(albedo: vec3f, n: vec3f, v: vec3f) -> vec3f {                    // the look kit's lighting
+      let l = KEY;
+      let h = normalize(l + v);
+      let diffuse = max(dot(n, l), 0.0);
+      let sky = mix(vec3f(0.03, 0.03, 0.04), vec3f(0.22, 0.24, 0.3), n.y * 0.5 + 0.5);
+      let spec = pow(max(dot(n, h), 0.0), 64.0) * 0.6;
+      let rim = pow(1.0 - max(dot(n, v), 0.0), 4.0) * 0.8;
+      return albedo * (diffuse * 1.6 + sky) + vec3f(spec) + rim * mix(albedo, vec3f(1.0), 0.5);
+    }
+  `;
+
+  // The sheet: two triangles per grid cell, built from vertex_index. A triangle is drawn only while
+  // its 3 links are intact (the fragment shader discards it otherwise), and near broken links it frays.
+  // Normals are blended bilinearly over the whole cell, so shading never shows the triangle diagonals.
+  const CELLS = (N - 1) * (N - 1);
+  const cloth = draw(gpu, {
+    label: "cloth", vertices: CELLS * 6, cull: "none",
+    shader: prepareShader(`
+      ${COMMON}
+      ${LOOK}
+      @group(0) @binding(0) var<storage, read> pos: array<vec4f>;
+      @group(0) @binding(1) var<storage, read> links: array<u32>;
+      @group(0) @binding(2) var<storage, read> surf: array<vec4f>;
+      @group(0) @binding(3) var<uniform> camera: Camera;
+      ${LINKS}
+      struct Out {
+        @builtin(position) clip: vec4f,
+        @location(0) world: vec3f,
+        @location(1) grid: vec2f,                                             // grid coordinates, 0..N-1
+        @location(2) @interpolate(flat) cell: u32,
+        @location(3) @interpolate(flat) state: u32,                           // 1 triangle intact, 2 whole cell intact
+      }
+      @vertex fn vs_main(@builtin(vertex_index) vi: u32) -> Out {
+        var corners = array<vec2i, 6>(vec2i(0, 0), vec2i(1, 1), vec2i(1, 0), vec2i(0, 0), vec2i(0, 1), vec2i(1, 1));
+        let cell = i32(vi / 6u);
+        let k = vi % 6u;
+        let a = vec2i(cell % (N - 1), cell / (N - 1));                        // the cell's top-left particle
+        let c = a + corners[k];
+        // Triangle (a, a+(1,1), a+(1,0)) needs its 3 links, as does (a, a+(0,1), a+(1,1)).
+        let diag = linkOk(a, vec2i(1, 1));
+        let upper = diag && linkOk(a, vec2i(1, 0)) && linkOk(a + vec2i(1, 0), vec2i(0, 1));
+        let lower = diag && linkOk(a, vec2i(0, 1)) && linkOk(a + vec2i(0, 1), vec2i(1, 0));
+        let p = pos[idx(c)].xyz;
+        var o: Out;
+        o.clip = camera.viewProjection * vec4f(p, 1.0);
+        o.world = p;
+        o.grid = vec2f(c);
+        o.cell = idx(a);
+        o.state = select(0u, 1u, select(lower, upper, k < 3u)) + select(0u, 1u, upper && lower);
+        return o;
+      }
+      fn hash(x: f32) -> f32 { return fract(sin(x * 127.1 + 311.7) * 43758.5453); }
+      @fragment fn fs_main(in: Out, @builtin(front_facing) front: bool) -> @location(0) vec4f {
+        if (in.state == 0u) { discard; }
+        // Blend the 4 corners: bilinear over an intact cell, barycentric inside a lone triangle.
+        let a = cellOf(in.cell);
+        let local = clamp(in.grid - vec2f(a), vec2f(0.0), vec2f(1.0));
+        var w = vec4f((1.0 - local.x) * (1.0 - local.y), local.x * (1.0 - local.y), (1.0 - local.x) * local.y, local.x * local.y);
+        if (in.state == 1u) {
+          w = select(vec4f(1.0 - local.y, 0.0, local.y - local.x, local.x), vec4f(1.0 - local.x, local.x - local.y, 0.0, local.y), local.x >= local.y);
+        }
+        let i0 = in.cell * 2u; let i1 = i0 + 2u; let i2 = i0 + u32(N) * 2u; let i3 = i2 + 2u;
+        let s = surf[i0] * w.x + surf[i1] * w.y + surf[i2] * w.z + surf[i3] * w.w;
+        let tangent = (surf[i0 + 1u] * w.x + surf[i1 + 1u] * w.y + surf[i2 + 1u] * w.z + surf[i3 + 1u] * w.w).xyz;
+        // Torn edge: loose warp and weft threads of random length, plus a ragged outline.
+        let threads = pow(max(hash(floor(in.grid.x * 4.0)), hash(floor(in.grid.y * 4.0) + 71.0)), 3.0);
+        let ragged = hash(floor(in.grid.x * 1.5) + floor(in.grid.y * 1.5) * 17.0);
+        let edge = s.w * 4.0 - (0.3 + 1.1 * threads + 0.3 * ragged);
+        if (edge > 0.0) { discard; }
+        let v = normalize(camera.eye.xyz - in.world);
+        let sheet = normalize(s.xyz);                                         // points out of the front side
+        var n = sheet * select(-1.0, 1.0, front);                             // two-sided: flip for the back face
+        if (dot(n, v) < 0.0) { n = -n; }                                      // at fold crests a smooth normal can still point away
+        let frontSide = smoothstep(-0.2, 0.2, dot(sheet, v));                 // which side we see, without per-triangle flicker
+        let accent = pow(vec3f(0.898, 0.604, 0.643), vec3f(2.2));
+        let highlight = pow(vec3f(1.0, 0.941, 0.918), vec3f(2.2));
+        let albedo = accent * mix(0.7, 1.0, frontSide) * 0.42;                // deep dyed silk; the back face 30% darker
+        var col = shade(albedo, n, v);
+        // Silk sheen: an anisotropic highlight across the threads (Kajiya-Kay), in the dye's colour.
+        let t = normalize(tangent - n * dot(tangent, n) + vec3f(1e-6));
+        let th = dot(t, normalize(KEY + v));
+        col += mix(accent, highlight, 0.4) * pow(sqrt(max(1.0 - th * th, 0.0)), 80.0) * 0.4;
+        col += albedo * max(dot(-n, KEY), 0.0) * 0.35;                        // thin silk glows when lit from behind
+        col = mix(col, highlight * 0.8, smoothstep(-0.5, 0.0, edge) * min(s.w * 6.0, 0.6)); // loose threads are pale and catch the light
+        return vec4f(pow(aces(col), vec3f(1.0 / 2.2)), 1.0);
+      }
+    `),
+    set: { pos: posA, links, surf, camera },
+  });
+
+  // The two pin heads: small metal spheres drawn as camera-facing impostors at the pinned particles.
+  const pins = draw(gpu, {
+    label: "pins", vertices: 6, instances: 2, cull: "none",
+    shader: prepareShader(`
+      ${COMMON}
+      ${LOOK}
+      @group(0) @binding(0) var<storage, read> pos: array<vec4f>;
+      @group(0) @binding(1) var<uniform> camera: Camera;
+      struct Out { @builtin(position) clip: vec4f, @location(0) uv: vec2f }
+      @vertex fn vs_main(@builtin(vertex_index) v: u32, @builtin(instance_index) inst: u32) -> Out {
+        var q = array<vec2f, 6>(vec2f(-1, -1), vec2f(1, -1), vec2f(1, 1), vec2f(-1, -1), vec2f(1, 1), vec2f(-1, 1));
+        let p = pos[select(0u, u32(N - 1), inst == 1u)].xyz;
+        let toward = normalize(camera.eye.xyz - p);
+        let w = p + toward * 0.04 + (camera.right.xyz * q[v].x + camera.up.xyz * q[v].y) * 0.032;
+        return Out(camera.viewProjection * vec4f(w, 1.0), q[v]);
+      }
+      @fragment fn fs_main(in: Out) -> @location(0) vec4f {
+        let r2 = dot(in.uv, in.uv);
+        if (r2 > 1.0) { discard; }
+        let v = normalize(cross(camera.right.xyz, camera.up.xyz));            // towards the eye
+        let n = camera.right.xyz * in.uv.x + camera.up.xyz * in.uv.y + v * sqrt(1.0 - r2);
+        let r = reflect(-v, n);
+        // Polished metal: a fake environment from the reflection, one bright band, a hot specular.
+        let env = mix(pow(vec3f(0.898, 0.604, 0.643), vec3f(2.2)) * 0.12, vec3f(0.5, 0.45, 0.45), smoothstep(-0.6, 0.7, r.y))
+                + vec3f(2.0) * smoothstep(0.1, 0.0, abs(r.y - 0.3));
+        let col = env + vec3f(pow(max(dot(n, normalize(KEY + v)), 0.0), 120.0) * 4.0);
+        return vec4f(pow(aces(col), vec3f(1.0 / 2.2)), 1.0);
+      }
+    `),
+    set: { pos: posA, camera },
+  });
+
+  // ---- Camera ------------------------------------------------------------------------------
+  const { perspective, viewMatrices, orbitRig, rigPose } = scene;
+  const FOV = 34, tanHalf = Math.tan(FOV * Math.PI / 360);
+  const projection = new Float32Array(16);
+  const pose = { position: new Float32Array(3), quaternion: new Float32Array(4) };
+  const view = { view: new Float32Array(16), viewProjection: new Float32Array(16) };
+  const rig = orbitRig({ target: [0, -0.02, 0], yaw: 0.3, pitch: 0.12, distance: 6 });
+  let aspect = 1;
+  const resize = () => {
+    aspect = canvas.clientWidth / Math.max(1, canvas.clientHeight);
+    perspective({ fov: FOV, near: 0.1, far: 50 }, aspect, projection);
+    // Fit: about 3.3 units of height in view, and at least 2.75 units of width on narrow screens.
+    const viewHeight = Math.max(3.3, 2.75 / aspect);
+    rig.distance = viewHeight / 2 / tanHalf;
+  };
+  resize(); screen.onResize(resize);
+  const camValues = { viewProjection: view.viewProjection, eye: [0, 0, 0, 1], right: [1, 0, 0, 0], up: [0, 1, 0, 0] };
+
+  // ---- Pointer: grab, pull, tear -----------------------------------------------------------
+  let dragging = false, pickPending = false, px = 0, py = 0, pickRadius = 0.12, lastTap = 0, lastX = 0, lastY = 0;
+  let tearFrom = 0, prewarm = 120;               // prewarm: frames simulated before the first one is shown
+  const rehang = () => { hang(); dragging = false; tearFrom = time.time + 1.5; };
+  canvas.addEventListener("pointerdown", (e) => {
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    const now = performance.now();
+    if (e.pointerType !== "mouse" && now - lastTap < 320 && Math.hypot(e.clientX - lastX, e.clientY - lastY) < 40) { lastTap = 0; rehang(); return; }
+    lastTap = now; lastX = e.clientX; lastY = e.clientY;
+    canvas.setPointerCapture(e.pointerId);
+    dragging = true; pickPending = true; px = e.clientX; py = e.clientY;
+    pickRadius = e.pointerType === "mouse" ? 0.1 : 0.2;
+    grab.write(noGrab);
+  });
+  canvas.addEventListener("pointermove", (e) => { if (dragging) { px = e.clientX; py = e.clientY; } });
+  const release = () => { dragging = false; };
+  canvas.addEventListener("pointerup", release);
+  canvas.addEventListener("pointercancel", release);
+  addEventListener("keydown", (e) => { if (e.key === "r" || e.key === "R") rehang(); });
+  document.getElementById("rehang").addEventListener("click", rehang);
+
+  // The pointer ray, from the camera through the pointer, written into simValues.
+  const pointerRay = () => {
+    const r = canvas.getBoundingClientRect(), m = view.view;
+    const sx = ((px - r.left) / r.width * 2 - 1) * tanHalf * aspect, sy = (1 - (py - r.top) / r.height * 2) * tanHalf;
+    // The view matrix's rows are the camera's right, up and back axes in world space.
+    const dx = m[0] * sx + m[1] * sy - m[2], dy = m[4] * sx + m[5] * sy - m[6], dz = m[8] * sx + m[9] * sy - m[10];
+    const len = Math.hypot(dx, dy, dz), o = simValues.rayO, d = simValues.rayD;
+    o[0] = pose.position[0]; o[1] = pose.position[1]; o[2] = pose.position[2]; o[3] = dragging ? 1 : 0;
+    d[0] = dx / len; d[1] = dy / len; d[2] = dz / len; d[3] = pickRadius * rig.distance / 6;
+  };
+
+  // One substep: integrate A->B, then an odd number of Jacobi iterations B->A, A->B, ..., B->A,
+  // so the state is back in A for tearing, drawing and the next substep.
+  const substep = (pass) => {
+    pass.dispatch(integrate, GROUPS);
+    for (let k = 0; k < ITER; k++) pass.dispatch(k % 2 === 0 ? solveBA : solveAB, GROUPS);
+    pass.dispatch(tear, GROUPS);
+  };
+  let steps = SUB;
+  const simulate = (pass) => {
+    if (pickPending) { pass.dispatch(pick, GROUPS); pass.dispatch(resolve, 1); pickPending = false; }
+    for (let s = 0; s < steps; s++) substep(pass);
+    pass.dispatch(shading, GROUPS);
+  };
+  const render = (pass) => { pass.draw(background); pass.draw(cloth); pass.draw(pins); };
+
+  const time = clock(gpu);
+  frameLoop(gpu, (frame) => {
+    const t = time.time;
+    const dt = prewarm > 0 ? 1 / 60 : Math.min(time.deltaTime, 1 / 30);
+    steps = prewarm > 0 ? SUB * prewarm : SUB;
+    if (prewarm > 0) tearFrom = t + 1;           // no tearing while it settles
+    prewarm = 0;
+
+    // Idle: the camera sways slowly; the breeze never stops (softer with reduced motion).
+    rig.yaw = 0.3 + 0.12 * Math.sin(t * (reducedMotion ? 0.03 : 0.09));
+    rigPose(rig, pose);
+    viewMatrices(pose, projection, view);
+    pointerRay();
+
+    const s = simValues.step;
+    s[0] = dt / SUB; s[1] = t; s[2] = reducedMotion ? 0.6 : 1.6; s[3] = t > tearFrom ? TEAR : 0;
+    sim.set(simValues);
+    const m = view.view;
+    camValues.eye[0] = pose.position[0]; camValues.eye[1] = pose.position[1]; camValues.eye[2] = pose.position[2];
+    camValues.right[0] = m[0]; camValues.right[1] = m[4]; camValues.right[2] = m[8];
+    camValues.up[0] = m[1]; camValues.up[1] = m[5]; camValues.up[2] = m[9];
+    camera.set(camValues);
+
+    frame.computePass(simulate);
+    frame.pass(screen, render);
+  });
+})();
+</script>
+</body>
+</html>
