@@ -7,6 +7,7 @@ import { startPrompt } from "../lib/server/quota.ts";
 import { MemoryQuotaStore } from "../lib/server/store.ts";
 
 const ORIGIN = "http://localhost:3000";
+process.env.FREE_PROMPTS = "10"; // several grants per test user
 const SSE = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
 
 function setup(overrides: Partial<ModelRouteDeps> = {}) {
@@ -145,4 +146,18 @@ test("fails closed when the quota store is unreachable", async () => {
   assert.equal(response.status, 503);
   assert.equal((await response.json()).error.code, "quota_unavailable");
   assert.equal(calls.length, 0);
+});
+
+test("accepts image parts within the limits and refuses more than five", async () => {
+  const { deps, store, calls } = setup();
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]).toString("base64");
+  const image = { type: "image_url", image_url: { url: `data:image/png;base64,${png}` } };
+  const body = (count: number) => ({ messages: [{ role: "user", content: [{ type: "text", text: "match this" }, ...Array.from({ length: count }, () => image)] }] });
+  const ok = await handleModelRequest(modelRequest({ grant: await grantFor(store), body: body(5) }), deps);
+  assert.equal(ok.status, 200);
+  await ok.text();
+  assert.equal(JSON.parse(String(calls[0].init.body)).messages[1].content.length, 6);
+  const tooMany = await handleModelRequest(modelRequest({ grant: await grantFor(store), body: body(6) }), deps);
+  assert.equal(tooMany.status, 400);
+  assert.equal((await tooMany.json()).error.code, "invalid_images");
 });

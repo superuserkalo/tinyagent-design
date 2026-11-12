@@ -9,6 +9,7 @@ import { INSTRUCTIONS } from "../agent.ts";
 import { TOOL_NAMES } from "../tools.ts";
 import { GATEWAY_URL, MAX_MODEL_BODY_BYTES, MAX_OUTPUT_TOKENS } from "./config.ts";
 import type { UserLookup } from "./hanko.ts";
+import { validateImages } from "./images.ts";
 import { json, sameOrigin } from "./origin.ts";
 import { useGrant } from "./quota.ts";
 import type { QuotaStore } from "./store.ts";
@@ -70,6 +71,8 @@ export async function handleModelRequest(request: Request, deps: ModelRouteDeps)
   const names = toolNames(body.tools);
   if (!names || names.some((name) => !(TOOL_NAMES as readonly string[]).includes(name)))
     return fail(400, "invalid_tools", "Only this site's tools may be sent.");
+  const imageError = validateImages(body.messages as Message[]);
+  if (imageError) return fail(400, "invalid_images", imageError.charAt(0).toUpperCase() + imageError.slice(1) + ".");
 
   // Counted only once the request is known to be well formed.
   let use;
