@@ -1,5 +1,5 @@
 // The database behind quotas and chats. Production: Cloudflare D1 over its HTTP API.
-// `next dev` without TINYAGENT_DEV_DB=d1: a local SQLite file (.data/dev.sqlite) with
+// `next dev` without TINYAGENT_DEV_DB=d1: a local SQLite file in the OS temp directory with
 // the same migrations and SQL, so development never writes to the production database.
 import { SessionStore } from "./sessions.ts";
 import { SqlQuotaStore, StoreUnavailableError, d1Executor, type QuotaStore, type SqlExecutor } from "./store.ts";
@@ -7,15 +7,15 @@ import { SqlQuotaStore, StoreUnavailableError, d1Executor, type QuotaStore, type
 let executor: Promise<SqlExecutor> | undefined;
 
 async function localExecutor(): Promise<SqlExecutor> {
-  const [{ DatabaseSync }, { mkdirSync }, { sqliteExecutor, migrations }] = await Promise.all([
-    import("node:sqlite"), import("node:fs"), import("./sqlite.ts"),
-  ]);
-  mkdirSync(".data", { recursive: true });
-  const db = new DatabaseSync(".data/dev.sqlite");
-  for (const sql of migrations(new URL("../../migrations/", import.meta.url))) db.exec(sql);
-  console.warn("[tinyagent-design] Development database: .data/dev.sqlite (local SQLite, same SQL as D1). " +
+  // The project root from npm's environment, not process.cwd(): a cwd-relative path in
+  // server code makes the dev bundler watch the whole project, and reload on every request.
+  const root = (process.env.TINYAGENT_ROOT ?? process.env.INIT_CWD ?? process.env.PWD ?? ".").replace(/\/$/, "");
+  const module = `file://${root}/scripts/dev-db.mjs`;
+  const { openDevDatabase } = await import(/* turbopackIgnore: true */ module) as { openDevDatabase: (root: string) => { file: string; executor: SqlExecutor } };
+  const { file, executor } = openDevDatabase(root);
+  console.warn(`[tinyagent-design] Development database: ${file} (local SQLite, same SQL as D1). ` +
     "Set TINYAGENT_DEV_DB=d1 to use the configured Cloudflare D1 instead.");
-  return sqliteExecutor(db);
+  return executor;
 }
 
 export function sqlExecutor(): Promise<SqlExecutor> {

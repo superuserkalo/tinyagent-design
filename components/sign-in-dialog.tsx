@@ -12,13 +12,15 @@ const RESEND_SECONDS = 30;
  * Cancel. Sign in continues in the same box with radian.sh's email flow: email,
  * then the code Hanko emails (or the account's password).
  */
-export default function SignInDialog({ open, onOpenChange, onSignedIn, startAtFlow }: {
+export default function SignInDialog({ open, onOpenChange, onSignedIn, startAtFlow, freePrompts }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onSignedIn: () => void;
   /** Skip the intro and show the email field at once (the sidebar's Sign in). */
   startAtFlow: boolean;
+  freePrompts: number;
 }) {
+  const designs = `${freePrompts} free ${freePrompts === 1 ? "design" : "designs"}`;
   const [step, setStep] = useState<"intro" | "flow">("intro");
   const [flow, setFlow] = useState<AnyState | null>(null);
   const [busy, setBusy] = useState(false);
@@ -129,7 +131,7 @@ export default function SignInDialog({ open, onOpenChange, onSignedIn, startAtFl
         {step === "intro" ? (
           <>
             <DialogTitle className="text-lg font-medium">Sign in with your Radian account</DialogTitle>
-            <DialogDescription className="mt-2 text-sm text-muted">You get 3 free designs.</DialogDescription>
+            <DialogDescription className="mt-2 text-sm text-muted">You get {designs}.</DialogDescription>
             <div className="mt-5 flex flex-wrap gap-2">
               <button
                 type="button"
@@ -147,7 +149,7 @@ export default function SignInDialog({ open, onOpenChange, onSignedIn, startAtFl
           <>
             <DialogTitle className="text-lg font-medium">{view.title ?? "Sign in with your Radian account"}</DialogTitle>
             <DialogDescription className="mt-2 text-sm text-muted">
-              {view.description ?? (flow?.name === "registration_init" ? "Create your radian.sh account. You get 3 free designs." : "Use your radian.sh email. New here? We create your account.")}
+              {view.description ?? (flow?.name === "registration_init" ? `Create your radian.sh account. You get ${designs}.` : "Use your radian.sh email. New here? We create your account.")}
             </DialogDescription>
             {view.primary && (
               <form ref={formRef} key={`${flow?.name ?? "init"}-${revision}`} onSubmit={submit} className="mt-4">

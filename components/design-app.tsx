@@ -1,10 +1,13 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type PointerEvent as ReactPointerEvent } from "react";
-import { DesignRuntime, PromptError, type RuntimeState } from "@/lib/client/runtime";
+import { api, setDevUser } from "@/lib/client/api";
+import type { AttachedImage } from "@/lib/client/images";
+import { DesignRuntime, PromptError, type Notice, type RuntimeState } from "@/lib/client/runtime";
 import { signOut } from "@/lib/client/hanko";
 import { buildTranscript } from "@/lib/transcript";
 import Account, { type AccountState } from "./account";
+import { FreePromptsContext } from "./how-it-works";
 import Composer, { type ComposerHandle, type Quota } from "./composer";
 import { Close, Menu, PanelLeft } from "./icons";
 import PreviewPane, { ExportMenu } from "./preview-pane";
@@ -15,7 +18,10 @@ import { button, cn } from "./ui";
 
 const LOADING: RuntimeState = {
   ready: false, chats: [], notice: null,
-  active: { id: "draft", records: [], stamps: new Map(), designs: [], running: false, liveText: "", phase: null, startedAt: null, draft: null, pending: null },
+  active: {
+    id: "draft", records: [], stamps: new Map(), designs: [], running: false, liveText: "", partialText: "", phase: null,
+    startedAt: null, draft: null, pending: null, watching: false, resumedAt: null,
+  },
 };
 const AGENT_WIDTH = { min: 320, max: 640 };
 let pageRuntime: DesignRuntime | null = null;
@@ -29,7 +35,7 @@ function useRuntime(runtime: DesignRuntime | null): RuntimeState {
   );
 }
 
-export default function DesignApp({ model, devTools }: { model: string; devTools: boolean }) {
+export default function DesignApp({ model: initialModel, freePrompts: initialFree, devTools }: { model: string; freePrompts: number; devTools: boolean }) {
   const [runtime, setRuntime] = useState<DesignRuntime | null>(null);
   const [scripted, setScripted] = useState(false);
   const [account, setAccount] = useState<AccountState>({ status: "loading" });
@@ -38,29 +44,38 @@ export default function DesignApp({ model, devTools }: { model: string; devTools
   const [pane, setPane] = useState<"preview" | "chat">("preview");
   const [drawer, setDrawer] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNotice] = useState<Notice | null>(null);
+  const [model, setModel] = useState(initialModel);
+  const [freePrompts, setFreePrompts] = useState(initialFree);
+  const [stopping, setStopping] = useState(false);
   const [now, setNow] = useState(() => Date.now());
-  const pendingPrompt = useRef<string | null>(null);
+  const pendingPrompt = useRef<{ text: string; images: AttachedImage[] } | null>(null);
   const composer = useRef<ComposerHandle>(null);
   const thread = useRef<HTMLDivElement>(null);
   const state = useRuntime(runtime);
   const active = state.active;
 
-  const loadAccount = useCallback(async () => {
+  const loadAccount = useCallback(async (): Promise<boolean> => {
     try {
-      const response = await fetch("/api/me", { cache: "no-store", credentials: "same-origin" });
-      const body = await response.json() as { user: { email: string | null } | null; promptsLeft: number | null };
+      const response = await api<{ user: { email: string | null } | null; promptsLeft: number | null; model: string; freePrompts: number }>("/api/me");
+      const body = response.body;
+      if (body.model) setModel(body.model);
+      if (typeof body.freePrompts === "number") setFreePrompts(body.freePrompts);
       setAccount(body.user ? { status: "signed-in", email: body.user.email, promptsLeft: body.promptsLeft } : { status: "signed-out" });
+      return Boolean(body.user);
     } catch {
       setAccount({ status: "signed-out" });
+      return false;
     }
   }, []);
 
-  // One runtime per tab. It opens IndexedDB and resumes any run a reload interrupted.
+  // One runtime per tab. Chats come from the server; a run a reload interrupted resumes.
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const isScripted = devTools && params.get("scripted") === "1";
     setScripted(isScripted);
+    // Development only: scripted runs act as a named local user (?as=name), no sign-in.
+    if (isScripted) setDevUser(/^[a-z0-9-]{1,32}$/.test(params.get("as") ?? "") ? params.get("as") : "dev");
     setCollapsed(document.documentElement.classList.contains("sidebar-collapsed"));
     // One per page: React's development double-run of effects must not open a second
     // runtime, which would resume the same interrupted run twice.
@@ -76,9 +91,8 @@ export default function DesignApp({ model, devTools }: { model: string; devTools
       onRunEnd: () => { if (!isScripted) void loadAccount(); },
     });
     setRuntime(instance);
-    void instance.start(params.get("s"));
     if (devTools) (window as unknown as { __tinyagent?: unknown }).__tinyagent = instance.debug();
-    void loadAccount();
+    void loadAccount().then((signedIn) => instance.start(params.get("s"), signedIn));
   }, [devTools, loadAccount]);
 
   useEffect(() => {
@@ -105,8 +119,10 @@ export default function DesignApp({ model, devTools }: { model: string; devTools
 
   const versions = useMemo(() => new Map(active.designs.map((design, index) => [design.id, index + 1])), [active.designs]);
   const entries = useMemo(
-    () => buildTranscript(active.id, active.records, active.stamps, versions, { running: active.running, text: active.liveText }),
-    [active.id, active.records, active.stamps, versions, active.running, active.liveText],
+    () => buildTranscript(active.id, active.records, active.stamps, versions, {
+      running: active.running, text: active.liveText, watching: active.watching, resumedAt: active.resumedAt, partialText: active.partialText,
+    }),
+    [active.id, active.records, active.stamps, versions, active.running, active.liveText, active.watching, active.resumedAt, active.partialText],
   );
 
   // Follow the conversation while it grows, unless the reader scrolled up.
@@ -141,18 +157,18 @@ export default function DesignApp({ model, devTools }: { model: string; devTools
 
   const openSignIn = (atFlow: boolean) => setSignIn({ open: true, atFlow });
 
-  const send = useCallback(async (text: string): Promise<boolean> => {
+  const send = useCallback(async (text: string, images: AttachedImage[] = []): Promise<boolean> => {
     if (!runtime) return false;
     if (!scripted) {
       if (account.status === "loading") return false;
       if (account.status === "signed-out") {
-        pendingPrompt.current = text;
-        composer.current?.setValue(text);
+        pendingPrompt.current = { text, images };
+        composer.current?.setDraft(text, images);
         openSignIn(false);
         return false;
       }
       if (account.promptsLeft === 0) {
-        setNotice("Your free prompts are used.");
+        setNotice({ text: "Your free prompts are used." });
         return false;
       }
     }
@@ -160,8 +176,8 @@ export default function DesignApp({ model, devTools }: { model: string; devTools
     setNotice(null);
     setPane("chat");
     pinned.current = true;
-    runtime.send(text).catch((error) => {
-      composer.current?.setValue(text);
+    runtime.send(text, images).catch((error) => {
+      composer.current?.setDraft(text, images);
       if (error instanceof PromptError && error.code === "not_signed_in") {
         setAccount({ status: "signed-out" });
         openSignIn(false);
@@ -173,21 +189,26 @@ export default function DesignApp({ model, devTools }: { model: string; devTools
   const onSignedIn = useCallback(async () => {
     setSignIn((current) => ({ ...current, open: false }));
     await loadAccount();
-    const text = pendingPrompt.current;
+    await runtime?.start(null, true);
+    const draft = pendingPrompt.current;
     pendingPrompt.current = null;
-    if (text) {
-      composer.current?.setValue("");
+    if (draft) {
+      composer.current?.setDraft("", []);
       // The account state updates on the next render; send through the runtime directly.
       setViewing(null);
       setPane("chat");
-      runtime?.send(text).catch(() => composer.current?.setValue(text));
+      runtime?.send(draft.text, draft.images).catch(() => composer.current?.setDraft(draft.text, draft.images));
     }
   }, [loadAccount, runtime]);
 
   const doSignOut = useCallback(async () => {
     try { await signOut(); } catch {}
     await loadAccount();
-  }, [loadAccount]);
+    runtime?.newDesign();
+    await runtime?.start(null, false);
+  }, [loadAccount, runtime]);
+
+  useEffect(() => { if (!active.running) setStopping(false); }, [active.running]);
 
   // The divider between the conversation and the preview. Its width persists.
   const resizing = useRef<{ startX: number; startWidth: number; pane: "agent" | "sidebar" } | null>(null);
@@ -209,10 +230,16 @@ export default function DesignApp({ model, devTools }: { model: string; devTools
   const title = active.id === "draft" ? "Design" : state.chats.find((chat) => chat.id === active.id)?.title ?? "Design";
   const shownDesign = (viewing ? active.designs.find((design) => design.id === viewing) : null) ?? active.designs.at(-1) ?? null;
   const busy = active.running || active.pending !== null;
-  const activity = active.pending ? "sending" : active.running ? (active.phase ?? "thinking") : null;
+  const activity = active.pending ? "sending" : active.running ? (active.phase ?? "thinking") : active.watching ? "running on another device" : null;
+  // Timed from the run's start, also after a reload or on another device.
+  const runStartedAt = useMemo(() => {
+    const start = [...active.records].reverse().find((record) => record.type === "run_start");
+    return start ? active.stamps.get(Number(start.sequence)) ?? null : null;
+  }, [active.records, active.stamps]);
+  const activityStart = active.pending ? null : runStartedAt ?? active.startedAt;
   const quota: Quota = scripted ? { kind: "hidden" }
     : account.status === "loading" ? { kind: "hidden" }
-      : account.status === "signed-out" ? { kind: "signed-out" }
+      : account.status === "signed-out" ? { kind: "signed-out", free: freePrompts }
         : account.promptsLeft == null ? { kind: "hidden" } : { kind: "left", left: account.promptsLeft };
   const intro = active.id === "draft" && !active.pending;
 
@@ -230,6 +257,7 @@ export default function DesignApp({ model, devTools }: { model: string; devTools
   );
 
   return (
+    <FreePromptsContext.Provider value={freePrompts}>
     <div className="flex h-dvh w-full overflow-hidden bg-bg text-fg">
       <a href="#main-content" className="sr-only focus:not-sr-only focus:absolute focus:left-2 focus:top-2 focus:z-50 focus:bg-bg focus:px-3 focus:py-2">Skip to conversation</a>
       <div id="session-sidebar" className="relative hidden h-full shrink-0 md:block md:[html.sidebar-collapsed_&]:hidden">
@@ -287,7 +315,7 @@ export default function DesignApp({ model, devTools }: { model: string; devTools
               <div className="min-w-0 flex-1">
                 <h1 className="truncate text-sm font-medium tracking-[-0.01em]">{title}</h1>
               </div>
-              {shownDesign && <ExportMenu design={shownDesign} onNotice={setNotice} />}
+              {shownDesign && runtime && <ExportMenu design={shownDesign} load={runtime.designHtml.bind(runtime)} onNotice={(text) => setNotice({ text })} />}
               <button
                 type="button"
                 aria-controls="preview-pane"
@@ -300,7 +328,14 @@ export default function DesignApp({ model, devTools }: { model: string; devTools
             </div>
             {notice && (
               <div role="alert" className="flex items-center justify-between gap-3 bg-hover px-4 py-2 text-sm text-fg">
-                <span>{notice}</span>
+                <span>
+                  {notice.text}{" "}
+                  {notice.watch && (
+                    <button type="button" className="underline underline-offset-2 hover:no-underline" onClick={() => { const id = notice.watch!; setNotice(null); select(id); }}>
+                      view it
+                    </button>
+                  )}
+                </span>
                 <button type="button" aria-label="dismiss" onClick={() => setNotice(null)} className="shrink-0 text-muted hover:text-fg"><Close className="size-3.5" /></button>
               </div>
             )}
@@ -317,18 +352,19 @@ export default function DesignApp({ model, devTools }: { model: string; devTools
           >
             <div className="mx-auto w-full max-w-2xl px-4 py-4 sm:px-5">
               <Transcript entries={entries} pending={active.pending} onSend={(text) => void send(text)} viewing={viewing} onView={(id) => { setViewing(id === active.designs.at(-1)?.id ? null : id); setPane("preview"); }} />
-              {activity && <ActivityLine label={activity} startedAt={active.startedAt} />}
+              {activity && <ActivityLine label={activity} startedAt={activityStart} />}
             </div>
           </div>
 
           {pane === "preview" && activity && (
             <div className="order-2 shrink-0 border-b border-line px-4 py-2 lg:hidden">
-              <ActivityLine label={activity} startedAt={active.startedAt} />
+              <ActivityLine label={activity} startedAt={activityStart} />
             </div>
           )}
 
           <div className="order-3 shrink-0 lg:order-none">
-            <Composer ref={composer} busy={busy} model={model} quota={quota} onSend={send} onStop={() => runtime?.stop()} onSignIn={() => openSignIn(true)} />
+            <Composer ref={composer} busy={busy} locked={active.watching} stopping={stopping} model={model} quota={quota} onSend={send}
+              onStop={() => { setStopping(true); runtime?.stop(); }} onSignIn={() => openSignIn(true)} />
           </div>
         </section>
 
@@ -345,16 +381,18 @@ export default function DesignApp({ model, devTools }: { model: string; devTools
         </div>
 
         <div className={cn("order-1 flex min-h-0 min-w-0 flex-1 lg:order-none", pane === "chat" && "hidden lg:flex")}>
-          <PreviewPane designs={active.designs} viewing={viewing} draft={active.draft} intro={intro} onLatest={() => setViewing(null)} />
+          <PreviewPane designs={active.designs} load={runtime ? runtime.designHtml.bind(runtime) : null} viewing={viewing} draft={active.draft} intro={intro} onLatest={() => setViewing(null)} />
         </div>
       </main>
 
       <SignInDialog
         open={signIn.open}
         startAtFlow={signIn.atFlow}
+        freePrompts={freePrompts}
         onOpenChange={(open) => { setSignIn((current) => ({ ...current, open })); if (!open) composer.current?.focus(); }}
         onSignedIn={() => void onSignedIn()}
       />
     </div>
+    </FreePromptsContext.Provider>
   );
 }

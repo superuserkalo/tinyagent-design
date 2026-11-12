@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
+import { FencedError, checkStorage, type Item, type Storage } from "tiny-agent-sdk/browser";
 import { CHUNK_CHARS, LEASE_MS, SessionStore } from "../lib/server/sessions.ts";
 import { migrations, sqliteExecutor } from "../lib/server/sqlite.ts";
 
@@ -135,4 +136,23 @@ test("loading pages large journals", async () => {
     after = page!.next;
   }
   assert.deepEqual(seen, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+});
+
+test("the server journal keeps the SDK's storage contract (checkStorage), as the browser's ServerStorage sees it", async () => {
+  const { store } = setup();
+  // The same mapping the API routes and lib/client/server-storage.ts make.
+  const storage: Storage = {
+    async load(id) {
+      const page = await store.load("alice", id);
+      return page && page.records.length ? page.records.map((row) => ({ ...row.record, sequence: row.seq }) as Item) : undefined;
+    },
+    async append(id, expected, record) {
+      const result = await store.append("alice", id, expected, { ...record, sequence: expected + 1 }, OWNER_A);
+      if (result !== "ok") throw new FencedError();
+      return expected + 1;
+    },
+    async list() { return (await store.list("alice")).map((chat) => chat.id); },
+    release() {},
+  };
+  await checkStorage(storage);
 });

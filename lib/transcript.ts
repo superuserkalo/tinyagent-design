@@ -10,6 +10,10 @@ export interface ToolRow {
   status: "running" | "done" | "error";
   /** The design's title, for publish_design. */
   detail?: string;
+  /** Size of the page it published, in characters. */
+  bytes?: number;
+  /** Run again after a reload. */
+  rerun?: boolean;
   durationMs?: number;
   output?: string;
 }
@@ -17,9 +21,10 @@ export interface ToolRow {
 export type RunState = "running" | "done" | "failed" | "interrupted";
 
 export type Entry =
-  | { kind: "user"; key: string; text: string }
+  | { kind: "user"; key: string; text: string; images: string[] }
   | { kind: "activity"; key: string; state: RunState; tools: ToolRow[]; updates: number; writing: boolean }
-  | { kind: "text"; key: string; text: string; streaming?: boolean }
+  | { kind: "text"; key: string; text: string; streaming?: boolean; interrupted?: boolean }
+  | { kind: "status"; key: string; text: string; detail?: string }
   | { kind: "artifact"; key: string; executionId: string; version: number | null }
   | { kind: "error"; key: string; text: string }
   | { kind: "divider"; key: string; durationMs?: number; usage?: { inputTokens: number; outputTokens: number } };
@@ -29,6 +34,18 @@ export interface Live {
   running: boolean;
   /** Text of the model turn streaming now, not yet journaled. */
   text: string;
+  /** Another tab or device is running it; this one follows the journal. */
+  watching?: boolean;
+  /** This tab resumed the run after the record with this sequence. */
+  resumedAt?: number | null;
+  /** What a reload cut off of the interrupted turn, shown until that turn streams again. */
+  partialText?: string;
+}
+
+function imagesOf(content: unknown): string[] {
+  if (!Array.isArray(content)) return [];
+  return content.filter((part) => part?.type === "image" && typeof part.data === "string" && typeof part.mediaType === "string")
+    .map((part) => `data:${part.mediaType};base64,${part.data}`);
 }
 
 function textOf(content: unknown): string {
@@ -73,14 +90,18 @@ export function buildTranscript(
     run.open = false;
   };
 
+  const resumedMarker = () => {
+    if (run?.open && live.resumedAt != null) entries.push({ kind: "status", key: `${run.key}-resumed`, text: "resumed", detail: "after a reload, from the last saved step" });
+  };
   for (const record of records) {
     const seq = Number(record.sequence);
     const item = (record.item ?? {}) as Item;
+    if (live.resumedAt != null && seq === live.resumedAt + 1) resumedMarker();
     switch (record.type) {
       case "run_start": {
         if (run?.open) close("failed");
         const key = `run-${seq}`;
-        entries.push({ kind: "user", key: `${key}-user`, text: textOf(item.content) });
+        entries.push({ kind: "user", key: `${key}-user`, text: textOf(item.content), images: imagesOf(item.content) });
         const activity: Entry & { kind: "activity" } = { kind: "activity", key: `${key}-activity`, state: "running", tools: [], updates: 0, writing: false };
         entries.push(activity);
         run = { key, startSeq: seq, activity, rows: new Map(), open: true };
@@ -99,7 +120,8 @@ export function buildTranscript(
         const row = {
           key: `tool-${seq}`, seq, name: String(record.toolName), status: "running" as const,
           detail: typeof args.title === "string" ? args.title : undefined,
-        };
+          bytes: typeof args.html === "string" ? args.html.length : undefined,
+        } as ToolRow & { seq: number };
         run.rows.set(String(record.callId), row);
         run.activity.tools.push(row);
         break;
@@ -107,7 +129,7 @@ export function buildTranscript(
       case "tool_rerun":
       case "tool_resumed": {
         const row = run?.rows.get(String(record.callId));
-        if (row) row.status = "running";
+        if (row) { row.status = "running"; row.rerun = true; }
         break;
       }
       case "tool_result": {
@@ -147,15 +169,15 @@ export function buildTranscript(
     }
   }
 
+  if (run?.open && live.resumedAt != null && records.length === live.resumedAt) resumedMarker();
   if (run?.open) {
-    if (live.running) {
-      run.activity.state = "running";
-      if (live.text.trim()) {
-        run.activity.writing = true;
-        entries.push({ kind: "text", key: `${run.key}-live`, text: live.text, streaming: true });
-      }
-    } else {
-      run.activity.state = "interrupted";
+    run.activity.state = live.running || live.watching ? "running" : "interrupted";
+    if (live.running && live.text.trim()) {
+      run.activity.writing = true;
+      entries.push({ kind: "text", key: `${run.key}-live`, text: live.text, streaming: true });
+    } else if (live.partialText?.trim()) {
+      // The turn a reload cut off: what had arrived, until the redone turn streams.
+      entries.push({ kind: "text", key: `${run.key}-partial`, text: live.partialText, interrupted: true });
     }
     if (run.artifact) entries.push({ kind: "artifact", key: `${run.key}-artifact`, executionId: run.artifact, version: versions.get(run.artifact) ?? null });
   }

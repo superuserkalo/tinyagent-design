@@ -1,56 +1,84 @@
-// The agent loop in the tab. Each chat is a TinyAgent Session journaled in
-// IndexedDB; this object opens them, runs prompts, resumes runs a reload cut
-// short, and publishes a snapshot the React tree renders.
+// The agent loop in the tab. Each chat is a TinyAgent Session whose journal lives on
+// the server (lib/client/server-storage.ts), keyed by the radian.sh account, so it
+// follows the user to every device. One tab runs a chat at a time: it holds the
+// chat's lease while a run is active; any other tab or device watches by polling.
+// A run that a reload cut short continues in the same tab (it keeps its lease owner
+// id in sessionStorage); elsewhere it continues only once the lease has lapsed.
 import {
   ChatCompletionsProvider,
   Session,
   checkStorage,
   type AgentEvent,
+  type ContentPart,
   type Item,
   type Provider,
 } from "tiny-agent-sdk/browser";
 import { createDesignAgent } from "../agent.ts";
-import { JournalStorage } from "../storage.ts";
+import { compactRequest } from "../request-budget.ts";
 import { publishDesignTool } from "../tools.ts";
-import { errorText, firstPrompt } from "../transcript.ts";
+import { api, apiHeaders, errorMessage } from "./api.ts";
 import { partialJsonString, watchToolArguments } from "./draft.ts";
-import { IdbJournalBackend, SiteDatabase, openDatabase, type ChatMeta, type StoredDesign } from "./idb.ts";
+import type { AttachedImage } from "./images.ts";
 import { scriptedProvider } from "./scripted.ts";
+import { ServerStorage } from "./server-storage.ts";
 
 const GRANT_HEADER = "x-tinyagent-grant";
 /** The server picks the real model; the journal records this name. */
 const MODEL = "gateway";
+const HEARTBEAT_MS = 7_000;
+const WATCH_MS = 1_500;
+const IDLE_WATCH_MS = 3_000;
+const CHATS_MS = 15_000;
 
-export type Phase = "sending" | "thinking" | "generating";
+export type Phase = "sending" | "thinking" | "generating" | "resuming";
 
 export interface ChatSummary {
   id: string;
   title: string | null;
   updatedAt: number;
+  /** A tab somewhere holds the chat's lease. */
   busy: boolean;
 }
 
+export interface DesignMeta {
+  id: string;
+  title: string;
+  seq: number;
+}
+
 export interface ActiveView {
-  /** "draft" until the first prompt creates the session. */
+  /** "draft" until the first prompt creates the chat. */
   id: string;
   records: Item[];
   stamps: Map<number, number>;
-  designs: StoredDesign[];
+  designs: DesignMeta[];
   running: boolean;
   liveText: string;
+  /** Text of the turn a reload interrupted, kept in this tab only, shown until the resumed turn streams. */
+  partialText: string;
   phase: Phase | null;
   startedAt: number | null;
   /** The page as the model writes it, before publish_design runs. */
   draft: string | null;
   /** A prompt waiting for its grant. */
-  pending: string | null;
+  pending: { text: string; images: AttachedImage[] } | null;
+  /** Another tab or device is running this chat; this one shows its progress. */
+  watching: boolean;
+  /** The journal sequence after which this run was resumed in this tab. */
+  resumedAt: number | null;
+}
+
+export interface Notice {
+  text: string;
+  /** Offer to show the chat as it runs elsewhere. */
+  watch?: string;
 }
 
 export interface RuntimeState {
   ready: boolean;
   chats: ChatSummary[];
   active: ActiveView;
-  notice: string | null;
+  notice: Notice | null;
 }
 
 export class PromptError extends Error {
@@ -68,15 +96,24 @@ interface Live {
   startedAt: number | null;
   draft: string | null;
   controller: AbortController | null;
+  resumedAt: number | null;
+}
+
+interface ChatRow {
+  id: string;
+  title: string;
+  updatedAt: number;
+  grant: { id: string; expiresAt: number } | null;
+  lease: { owner: string; until: number } | null;
 }
 
 const EMPTY: ActiveView = {
-  id: "draft", records: [], stamps: new Map(), designs: [], running: false, liveText: "", phase: null,
-  startedAt: null, draft: null, pending: null,
+  id: "draft", records: [], stamps: new Map(), designs: [], running: false, liveText: "", partialText: "", phase: null,
+  startedAt: null, draft: null, pending: null, watching: false, resumedAt: null,
 };
 
 export interface RuntimeOptions {
-  /** Development only: the scripted model, no auth, no gateway. */
+  /** Development only: the scripted model, no gateway. */
   scripted: boolean;
   /** Development only: publish_design waits a few seconds after storing, so a reload can land mid-tool. */
   slowTool: boolean;
@@ -84,21 +121,62 @@ export interface RuntimeOptions {
   onRunEnd?: () => void;
 }
 
+function tabOwner(): string {
+  // Kept for the life of the tab, across reloads, so a reloaded tab can take its own lease back at once.
+  try {
+    const saved = sessionStorage.getItem("ta-tab");
+    if (saved) return saved;
+    const owner = `tab-${crypto.randomUUID()}`;
+    sessionStorage.setItem("ta-tab", owner);
+    return owner;
+  } catch {
+    return `tab-${crypto.randomUUID()}`;
+  }
+}
+
+function newSessionId(): string {
+  return `s_${Array.from(crypto.getRandomValues(new Uint8Array(12)), (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+}
+
+/** UI-only memory of a turn's streamed text, so a reload can show it while the turn is redone. */
+const partial = {
+  key: (id: string) => `ta-partial:${id}`,
+  save(id: string, cursor: number, text: string) {
+    try { sessionStorage.setItem(partial.key(id), JSON.stringify({ cursor, text })); } catch {}
+  },
+  take(id: string, cursor: number): string {
+    try {
+      const saved = JSON.parse(sessionStorage.getItem(partial.key(id)) ?? "null") as { cursor: number; text: string } | null;
+      return saved && saved.cursor === cursor ? saved.text : "";
+    } catch {
+      return "";
+    }
+  },
+  clear(id: string) {
+    try { sessionStorage.removeItem(partial.key(id)); } catch {}
+  },
+};
+
 export class DesignRuntime {
   private readonly options: RuntimeOptions;
-  private db!: SiteDatabase;
-  private storage!: JournalStorage;
+  private readonly owner = tabOwner();
+  private readonly storage: ServerStorage;
   private readonly sessions = new Map<string, Session>();
   private readonly grants = new Map<string, string>();
   private readonly live = new Map<string, Live>();
-  private readonly meta = new Map<string, ChatMeta>();
+  private readonly rows = new Map<string, ChatRow>();
+  private readonly html = new Map<string, Promise<string>>();
   private readonly listeners = new Set<() => void>();
   private state: RuntimeState = { ready: false, chats: [], active: EMPTY, notice: null };
   private frame = 0;
+  private watcher: { id: string; timer: ReturnType<typeof setTimeout> | null } | null = null;
+  private chatsTimer: ReturnType<typeof setInterval> | null = null;
+  private signedIn = false;
 
   constructor(options: RuntimeOptions) {
     if (options.scripted && process.env.NODE_ENV !== "development") throw new Error("the scripted model exists only in development");
     this.options = options;
+    this.storage = new ServerStorage(this.owner);
   }
 
   subscribe = (listener: () => void) => {
@@ -113,69 +191,86 @@ export class DesignRuntime {
     for (const listener of this.listeners) listener();
   }
 
+  private patchActive(id: string, next: Partial<ActiveView>) {
+    if (this.state.active.id === id) this.set({ active: { ...this.state.active, ...next } });
+  }
+
   /** Text deltas arrive fast: publish at most once a frame. */
   private soon(work: () => void) {
     if (this.frame) return;
     this.frame = requestAnimationFrame(() => { this.frame = 0; work(); });
   }
 
-  async start(initialId: string | null): Promise<void> {
-    const database = openDatabase();
-    this.db = new SiteDatabase(database);
-    this.storage = new JournalStorage(new IdbJournalBackend(database));
-    for (const chat of await this.db.chats()) this.meta.set(chat.id, chat);
-    const ids = await this.storage.list();
-    // Open every chat's journal: a run that a reload cut short continues now.
-    const opened = await Promise.all(ids.map(async (id) => {
-      try { return await this.open(id); } catch { return null; }
-    }));
-    this.set({ ready: true, chats: this.summaries() });
-    const wanted = initialId && ids.includes(initialId) ? initialId : null;
-    if (wanted) await this.select(wanted);
-    for (const session of opened) if (session?.resumable) void this.resume(session);
+  /** Called once the account is known. Signed out, there are no chats to show. */
+  async start(initialId: string | null, signedIn: boolean): Promise<void> {
+    this.signedIn = signedIn;
+    if (!signedIn) {
+      this.set({ ready: true, chats: [] });
+      return;
+    }
+    await this.refreshChats().catch(() => {});
+    this.set({ ready: true });
+    this.chatsTimer ??= setInterval(() => void this.refreshChats().catch(() => {}), CHATS_MS);
+    window.addEventListener("focus", () => void this.refreshChats().catch(() => {}));
+    if (initialId && this.rows.has(initialId)) await this.select(initialId);
   }
 
-  private async open(id: string): Promise<Session> {
-    const existing = this.sessions.get(id);
-    if (existing) return existing;
-    const session = new Session(this.agentFor(id), { storage: this.storage, sessionId: id, resume: true });
-    await session.ready;
-    this.sessions.set(id, session);
-    if (!this.meta.has(id)) {
-      const now = Date.now();
-      this.meta.set(id, { id, title: firstPrompt(session.records)?.slice(0, 80) ?? "new chat", createdAt: now, updatedAt: now });
-    }
-    return session;
+  /** The sidebar, from the server: the same list on every device. */
+  async refreshChats(): Promise<void> {
+    if (!this.signedIn) return;
+    const response = await api<{ chats: ChatRow[]; now: number }>("/api/chats");
+    if (!response.ok) return;
+    const skew = response.body.now - Date.now();
+    this.rows.clear();
+    for (const row of response.body.chats) this.rows.set(row.id, row);
+    this.set({
+      chats: response.body.chats.map((row) => ({
+        id: row.id, title: row.title || null, updatedAt: row.updatedAt,
+        busy: (this.live.get(row.id)?.running ?? false) || Boolean(row.lease && row.lease.until > Date.now() + skew),
+      })),
+    });
   }
 
   private agentFor(sessionId: string) {
     const tool = publishDesignTool(async (design, signal) => {
-      const id = design.executionId.slice(0, design.executionId.lastIndexOf(":"));
-      await this.db.putDesign({ id: design.executionId, sessionId: id, title: design.title, html: design.html, createdAt: Date.now() });
-      const meta = this.meta.get(id);
-      if (meta && !meta.designTitled) await this.saveMeta({ ...meta, title: design.title, designTitled: true });
+      const response = await api(`/api/designs/${encodeURIComponent(design.executionId)}`, { method: "PUT", body: { title: design.title, html: design.html }, signal });
+      if (!response.ok) throw new Error(errorMessage(response.body, "the design could not be saved"));
+      this.html.set(design.executionId, Promise.resolve(design.html));
+      const row = this.rows.get(sessionId);
+      if (!row?.title || row.title === this.firstTitle.get(sessionId)) {
+        await api(`/api/chats/${encodeURIComponent(sessionId)}`, { method: "PATCH", body: { title: design.title } }).catch(() => {});
+        if (row) row.title = design.title;
+        this.firstTitle.delete(sessionId);
+      }
       if (this.options.scripted && this.options.slowTool) {
         await new Promise<void>((resolve, reject) => {
           const timer = setTimeout(resolve, 4000);
           signal.addEventListener("abort", () => { clearTimeout(timer); reject(signal.reason); }, { once: true });
         });
       }
-      const designs = await this.db.designs(id);
+      const designs = await this.loadDesigns(sessionId);
       return designs.findIndex((row) => row.id === design.executionId) + 1;
     });
     return createDesignAgent({ model: MODEL, provider: this.providerFor(sessionId), tools: [tool] });
   }
 
+  private readonly firstTitle = new Map<string, string>();
+
   private providerFor(sessionId: string): Provider {
-    if (this.options.scripted) return scriptedProvider();
+    if (this.options.scripted) return scriptedProvider(this.options.slowTool ? 4000 : 1500);
     return new ChatCompletionsProvider({
       baseUrl: `${window.location.origin}/api/model/v1`,
       apiKey: "", // No key in the page: the server holds the gateway credential.
       fetch: async (input, init) => {
-        const headers = new Headers(init?.headers);
+        const headers = apiHeaders(init?.headers);
         const grant = this.grants.get(sessionId);
         if (grant) headers.set(GRANT_HEADER, grant);
-        const response = await fetch(input, { ...init, headers, credentials: "same-origin" });
+        // Older pages and images are dropped from the request; the journal keeps them.
+        let body = init?.body;
+        if (typeof body === "string") {
+          try { body = JSON.stringify(compactRequest(JSON.parse(body))); } catch {}
+        }
+        const response = await fetch(input, { ...init, body, headers, credentials: "same-origin" });
         if (!response.ok || !response.body) return response;
         const [forSdk, forDraft] = response.body.tee();
         void watchToolArguments(forDraft, (args) => this.onDraft(sessionId, args));
@@ -193,78 +288,191 @@ export class DesignRuntime {
     this.soon(() => this.refreshLive(sessionId));
   }
 
-  private summaries(): ChatSummary[] {
-    return [...this.sessions.keys()]
-      .map((id) => this.meta.get(id))
-      .filter((meta): meta is ChatMeta => Boolean(meta) && !meta!.hidden)
-      .sort((a, b) => b.updatedAt - a.updatedAt)
-      .map((meta) => ({ id: meta.id, title: meta.title, updatedAt: meta.updatedAt, busy: this.live.get(meta.id)?.running ?? false }));
+  private async loadDesigns(id: string): Promise<DesignMeta[]> {
+    const response = await api<{ designs: DesignMeta[] }>(`/api/chats/${encodeURIComponent(id)}/designs`);
+    const designs = response.ok ? response.body.designs : [];
+    this.patchActive(id, { designs });
+    return designs;
   }
 
-  private async saveMeta(meta: ChatMeta) {
-    this.meta.set(meta.id, meta);
-    await this.db.putChat(meta);
+  /** A design's HTML, fetched once. */
+  designHtml(id: string): Promise<string> {
+    let html = this.html.get(id);
+    if (!html) {
+      html = api<{ html: string }>(`/api/designs/${encodeURIComponent(id)}`).then((response) => {
+        if (!response.ok) throw new Error("the design could not be loaded");
+        return response.body.html;
+      });
+      html.catch(() => this.html.delete(id));
+      this.html.set(id, html);
+    }
+    return html;
+  }
+
+  private async open(id: string, fresh = false): Promise<Session> {
+    const existing = this.sessions.get(id);
+    if (existing && !fresh) return existing;
+    const session = new Session(this.agentFor(id), { storage: this.storage, sessionId: id, resume: true });
+    await session.ready;
+    this.sessions.set(id, session);
+    return session;
+  }
+
+  private viewOf(id: string, session: Session | null, records: Item[], designs: DesignMeta[], watching: boolean): ActiveView {
+    const live = this.live.get(id);
+    const cursor = records.length;
+    return {
+      id, records, stamps: new Map(this.storage.stamps(id)), designs,
+      running: live?.running ?? false, liveText: live?.text ?? "",
+      partialText: live?.text ? "" : (session?.resumable || watching ? partial.take(id, cursor) : ""),
+      phase: live?.phase ?? (watching ? "thinking" : null), startedAt: live?.startedAt ?? null,
+      draft: live?.draft ?? null, pending: null, watching, resumedAt: live?.resumedAt ?? null,
+    };
   }
 
   async select(id: string): Promise<void> {
     if (id === "draft") return this.newDesign();
-    const session = await this.open(id);
-    const [stamps, designs] = await Promise.all([this.storage.stamps(id), this.db.designs(id)]);
-    this.set({ active: this.viewOf(id, session, stamps, designs), notice: null });
+    this.stopWatching();
+    this.set({ notice: null });
+    let session: Session;
+    try {
+      // A chat this tab is not running is read fresh: another device may have moved it on.
+      session = await this.open(id, !this.live.get(id)?.running);
+    } catch (error) {
+      this.set({ notice: { text: error instanceof Error ? error.message : "This chat could not be opened." } });
+      return;
+    }
+    const designs = await this.loadDesigns(id).catch(() => []);
+    const row = await this.chatRow(id);
+    void this.refreshChats().catch(() => {});
+    const running = this.live.get(id)?.running ?? false;
+    const elsewhere = !running && this.heldElsewhere(row);
+    this.set({ active: this.viewOf(id, session, session.records, designs, elsewhere) });
+    if (running) return;
+    if (!elsewhere && session.resumable) await this.resume(id, session, row);
+    // Not running here: follow it, in case another tab or device runs it.
+    if (!this.live.get(id)?.running) this.watch(id);
+  }
+
+  private async chatRow(id: string): Promise<ChatRow | null> {
+    const response = await api<{ chat: ChatRow; now: number }>(`/api/chats/${encodeURIComponent(id)}`);
+    if (!response.ok) return null;
+    const skew = response.body.now - Date.now();
+    const row = { ...response.body.chat, lease: response.body.chat.lease ? { ...response.body.chat.lease, until: response.body.chat.lease.until - skew } : null };
+    this.rows.set(id, row);
+    return row;
+  }
+
+  private heldElsewhere(row: ChatRow | null): boolean {
+    return Boolean(row?.lease && row.lease.owner !== this.owner && row.lease.until > Date.now());
   }
 
   newDesign(): void {
+    this.stopWatching();
     this.set({ active: EMPTY, notice: null });
   }
 
-  private viewOf(id: string, session: Session, stamps: Map<number, number>, designs: StoredDesign[]): ActiveView {
-    const live = this.live.get(id);
-    return {
-      id, records: session.records, stamps, designs, running: live?.running ?? false, liveText: live?.text ?? "",
-      phase: live?.phase ?? null, startedAt: live?.startedAt ?? null, draft: live?.draft ?? null, pending: null,
+  /**
+   * Follow the open chat while this tab is not running it: new records from another
+   * tab or device appear here, and while one holds the lease the composer is locked.
+   */
+  private watch(id: string) {
+    this.stopWatching();
+    const watcher = { id, timer: null as ReturnType<typeof setTimeout> | null };
+    this.watcher = watcher;
+    const tick = async () => {
+      if (this.watcher !== watcher || this.state.active.id !== id || this.live.get(id)?.running) return;
+      try {
+        const known = this.state.active.records.length;
+        const response = await api<{ records: { seq: number; at: number; record: Item }[]; next: number | null; lease: ChatRow["lease"]; now: number }>(
+          `/api/chats/${encodeURIComponent(id)}/records?after=${known}`);
+        if (this.watcher !== watcher || this.state.active.id !== id || this.live.get(id)?.running) return;
+        if (response.ok) {
+          const added = response.body.records.map((row) => ({ ...row.record, sequence: row.seq })) as Item[];
+          const stamps = this.storage.stamps(id);
+          for (const row of response.body.records) stamps.set(row.seq, row.at);
+          if (added.length) {
+            this.patchActive(id, { records: [...this.state.active.records, ...added], stamps: new Map(stamps), partialText: "" });
+            if (added.some((record) => record.type === "tool_result")) void this.loadDesigns(id);
+          }
+          const lease = response.body.lease;
+          const skew = response.body.now - Date.now();
+          const elsewhere = Boolean(lease && lease.owner !== this.owner && lease.until - skew > Date.now());
+          if (elsewhere && !this.state.active.watching) {
+            this.patchActive(id, { watching: true, phase: "thinking" });
+            void this.refreshChats().catch(() => {});
+          } else if (!elsewhere && this.state.active.watching) {
+            // The other tab finished, or went away: open the chat properly (and resume it, if a run was cut short).
+            this.stopWatching();
+            await this.select(id);
+            return;
+          }
+        }
+      } catch {}
+      watcher.timer = setTimeout(() => void tick(), this.state.active.watching ? WATCH_MS : IDLE_WATCH_MS);
     };
+    watcher.timer = setTimeout(() => void tick(), this.state.active.watching ? WATCH_MS : IDLE_WATCH_MS);
   }
 
-  /** Re-read one chat from its journal and IndexedDB, if it is the one on screen. */
-  private async refresh(id: string): Promise<void> {
-    this.set({ chats: this.summaries() });
-    if (this.state.active.id !== id) return;
-    const session = this.sessions.get(id);
-    if (!session) return;
-    const [stamps, designs] = await Promise.all([this.storage.stamps(id), this.db.designs(id)]);
-    if (this.state.active.id === id) this.set({ active: this.viewOf(id, session, stamps, designs) });
+  private stopWatching() {
+    if (this.watcher?.timer) clearTimeout(this.watcher.timer);
+    this.watcher = null;
+  }
+
+  private async lease(id: string, grant?: { id: string; expiresAt: number }): Promise<boolean> {
+    const response = await api(`/api/chats/${encodeURIComponent(id)}/lease`, { body: { owner: this.owner, ...(grant ? { grant } : {}) } });
+    return response.ok;
+  }
+
+  private release(id: string) {
+    void api(`/api/chats/${encodeURIComponent(id)}/lease`, { body: { owner: this.owner, release: true } }).catch(() => {});
   }
 
   private refreshLive(id: string) {
-    if (this.state.active.id !== id) return;
     const live = this.live.get(id);
-    this.set({ active: { ...this.state.active, liveText: live?.text ?? "", phase: live?.phase ?? null, draft: live?.draft ?? null, running: live?.running ?? false } });
+    this.patchActive(id, { liveText: live?.text ?? "", phase: live?.phase ?? null, draft: live?.draft ?? null, running: live?.running ?? false });
   }
 
-  private handler(id: string) {
+  private async refresh(id: string) {
+    const session = this.sessions.get(id);
+    if (!session || this.state.active.id !== id) return;
+    const live = this.live.get(id);
+    this.patchActive(id, {
+      records: session.records, stamps: new Map(this.storage.stamps(id)), running: live?.running ?? false,
+      phase: live?.phase ?? null, resumedAt: live?.resumedAt ?? null, watching: false,
+    });
+  }
+
+  private handler(id: string, session: Session) {
+    let saved = 0;
     return (event: AgentEvent) => {
       const live = this.live.get(id);
       if (!live) return;
       switch (event.type) {
         case "agent_start":
           live.running = true;
-          live.phase = "thinking";
+          live.phase = live.resumedAt !== null ? "resuming" : "thinking";
           void this.refresh(id);
           break;
         case "text_delta":
           live.text += event.delta;
           live.phase = "generating";
+          this.patchActive(id, { partialText: "" });
+          // Kept in this tab, so a reload mid-turn can show what had arrived.
+          if (Date.now() - saved > 400) { saved = Date.now(); partial.save(id, session.cursor, live.text); }
           this.soon(() => this.refreshLive(id));
           break;
         case "tool_execution_start":
           live.text = "";
           live.phase = "thinking";
+          partial.clear(id);
           void this.refresh(id);
           break;
         case "tool_execution_end":
           live.draft = null;
           live.phase = "thinking";
           void this.refresh(id);
+          void this.loadDesigns(id);
           break;
         case "agent_end":
           break;
@@ -272,91 +480,143 @@ export class DesignRuntime {
     };
   }
 
-  private async drive(id: string, work: (signal: AbortSignal, onEvent: (event: AgentEvent) => void) => Promise<unknown>) {
+  /** Run `work` holding the chat's lease, renewing it until the run ends. */
+  private async drive(id: string, session: Session, startedAt: number, resumedAt: number | null, work: (signal: AbortSignal, onEvent: (event: AgentEvent) => void) => Promise<unknown>) {
     const controller = new AbortController();
-    const live: Live = { running: true, text: "", phase: "thinking", startedAt: Date.now(), draft: null, controller };
+    const live: Live = { running: true, text: "", phase: resumedAt !== null ? "resuming" : "thinking", startedAt, draft: null, controller, resumedAt };
     this.live.set(id, live);
+    if (this.watcher?.id === id) this.stopWatching();
+    const heartbeat = setInterval(() => {
+      void this.lease(id).then((held) => {
+        // Another tab took the chat over (our lease had lapsed): stop spending on it.
+        if (!held) controller.abort();
+      });
+    }, HEARTBEAT_MS);
     void this.refresh(id);
+    void this.refreshChats().catch(() => {});
+    let fenced = false;
     try {
-      await work(controller.signal, this.handler(id));
-    } catch {
-      // A failed or stopped run is in the journal; the transcript shows it.
+      await work(controller.signal, this.handler(id, session));
+    } catch (error) {
+      const code = (error as { code?: string })?.code;
+      fenced = code === "session_fenced" || (error instanceof Error && /another tab|another device|fenced/i.test(error.message));
     } finally {
+      clearInterval(heartbeat);
       live.running = false;
       live.phase = null;
       live.draft = null;
       live.text = "";
       live.controller = null;
-      const meta = this.meta.get(id);
-      if (meta) await this.saveMeta({ ...meta, updatedAt: Date.now(), grant: undefined }).catch(() => {});
-      await this.refresh(id);
+      partial.clear(id);
+      this.grants.delete(id);
+      if (!fenced) this.release(id);
+      // The session object is spent after a fenced write; the next look reads the journal again.
+      if (fenced) this.sessions.delete(id);
+      if (fenced) this.set({ notice: { text: "This chat is running on another device.", watch: id } });
+      if (this.sessions.has(id)) await this.refresh(id);
+      if (this.state.active.id === id && !fenced) this.watch(id);
+      void this.refreshChats().catch(() => {});
+      void this.loadDesigns(id).catch(() => {});
       this.options.onRunEnd?.();
     }
   }
 
-  private async resume(session: Session): Promise<void> {
-    const id = session.id;
-    const grant = this.meta.get(id)?.grant;
-    if (!this.options.scripted) {
-      if (!grant || grant.expiresAt <= Date.now()) {
-        // Without a live grant the model route would refuse every request: set the run aside.
+  private runStart(session: Session): number {
+    const records = session.records;
+    const start = [...records].reverse().find((record) => record.type === "run_start");
+    return (start && this.storage.stamps(session.id).get(Number(start.sequence))) ?? Date.now();
+  }
+
+  private async resume(id: string, session: Session, row: ChatRow | null): Promise<void> {
+    const grant = row?.grant;
+    if (!this.options.scripted && (!grant || grant.expiresAt <= Date.now())) {
+      // Without a live grant the model route would refuse every request: set the run aside.
+      if (await this.lease(id)) {
         await session.abandon("The prompt's grant expired before the run could continue.").catch(() => {});
-        await this.refresh(id);
-        return;
+        this.release(id);
       }
-      this.grants.set(id, grant.id);
+      await this.refresh(id);
+      return;
     }
-    await this.drive(id, (signal, onEvent) => session.resume({ signal, onEvent }));
+    if (!(await this.lease(id))) {
+      this.patchActive(id, { watching: true });
+      return this.watch(id);
+    }
+    if (grant) this.grants.set(id, grant.id);
+    await this.drive(id, session, this.runStart(session), session.cursor, (signal, onEvent) => session.resume({ signal, onEvent }));
   }
 
   private async requestGrant(): Promise<{ id: string; expiresAt: number }> {
-    const response = await fetch("/api/prompts", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" } });
-    const body = await response.json().catch(() => null) as { grant?: { id: string; expiresAt: number }; remaining?: number; error?: { code: string; message: string } } | null;
-    if (typeof body?.remaining === "number") this.options.onPromptsLeft?.(body.remaining);
-    if (!response.ok || !body?.grant) throw new PromptError(body?.error?.code ?? "error", body?.error?.message ?? "The prompt could not be sent.");
-    return body.grant;
+    const response = await api<{ grant?: { id: string; expiresAt: number }; remaining?: number }>("/api/prompts", { body: {} });
+    if (typeof response.body?.remaining === "number") this.options.onPromptsLeft?.(response.body.remaining);
+    if (!response.ok || !response.body?.grant) {
+      throw new PromptError((response.body as { error?: { code?: string } })?.error?.code ?? "error", errorMessage(response.body, "The prompt could not be sent."));
+    }
+    return response.body.grant;
   }
 
   /** Send a prompt in the chat on screen, or start a new chat with it. */
-  async send(text: string): Promise<void> {
+  async send(text: string, images: AttachedImage[] = []): Promise<void> {
     const prompt = text.trim();
-    if (!prompt) return;
+    if (!prompt && images.length === 0) return;
     const activeId = this.state.active.id;
+    if (this.state.active.watching) throw new PromptError("busy_elsewhere", "This chat is running on another device.");
     if (activeId !== "draft" && this.live.get(activeId)?.running) return;
-    this.set({ active: { ...this.state.active, pending: prompt, phase: "sending" }, notice: null });
+    this.stopWatching();
+    this.set({ active: { ...this.state.active, pending: { text: prompt, images }, phase: "sending" }, notice: null });
+    const fail = (error: unknown): never => {
+      this.set({ active: { ...this.state.active, pending: null, phase: null }, notice: { text: error instanceof Error ? error.message : String(error) } });
+      throw error;
+    };
+
+    const id = activeId === "draft" ? newSessionId() : activeId;
+    // Take the chat first, so a second device cannot start on it at the same time.
+    const claimed = activeId === "draft"
+      ? await api("/api/chats", { body: { id, owner: this.owner, title: prompt.slice(0, 80) || "image prompt" } }).then((response) => response.ok)
+      : await this.lease(id);
+    if (!claimed) {
+      if (activeId !== "draft") {
+        this.set({ active: { ...this.state.active, pending: null, phase: null } });
+        await this.select(id);
+      }
+      return fail(new PromptError("busy_elsewhere", "This chat is running on another device."));
+    }
 
     let grant: { id: string; expiresAt: number } | undefined;
     if (!this.options.scripted) {
       try {
         grant = await this.requestGrant();
       } catch (error) {
-        this.set({ active: { ...this.state.active, pending: null, phase: null }, notice: error instanceof Error ? error.message : String(error) });
-        throw error;
+        this.release(id);
+        return fail(error);
       }
+      await this.lease(id, grant);
+      this.grants.set(id, grant.id);
     }
 
     let session: Session;
-    if (activeId === "draft") {
-      const id = `s_${Array.from(crypto.getRandomValues(new Uint8Array(12)), (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
-      session = new Session(this.agentFor(id), { storage: this.storage, sessionId: id });
-      await session.ready;
-      this.sessions.set(session.id, session);
-      const now = Date.now();
-      await this.saveMeta({ id: session.id, title: prompt.slice(0, 80), createdAt: now, updatedAt: now, grant });
-      const url = new URL(window.location.href);
-      url.searchParams.set("s", session.id);
-      window.history.replaceState(window.history.state, "", url);
-    } else {
-      session = await this.open(activeId);
-      const meta = this.meta.get(activeId)!;
-      await this.saveMeta({ ...meta, updatedAt: Date.now(), grant });
-      if (session.resumable) await session.abandon("A new prompt was sent.").catch(() => {});
+    try {
+      if (activeId === "draft") {
+        this.firstTitle.set(id, prompt.slice(0, 80) || "image prompt");
+        session = new Session(this.agentFor(id), { storage: this.storage, sessionId: id });
+        await session.ready;
+        this.sessions.set(id, session);
+        const url = new URL(window.location.href);
+        url.searchParams.set("s", id);
+        window.history.replaceState(window.history.state, "", url);
+      } else {
+        session = await this.open(id, true);
+        if (session.resumable) await session.abandon("A new prompt was sent.").catch(() => {});
+      }
+    } catch (error) {
+      this.release(id);
+      return fail(error);
     }
-    if (grant) this.grants.set(session.id, grant.id);
-    const id = session.id;
-    const [stamps, designs] = await Promise.all([this.storage.stamps(id), this.db.designs(id)]);
-    this.set({ active: this.viewOf(id, session, stamps, designs) });
-    await this.drive(id, (signal, onEvent) => session.run(prompt, { signal, onEvent }));
+    this.set({ active: this.viewOf(id, session, session.records, this.state.active.designs, false) });
+    const content: string | ContentPart[] = images.length
+      ? [{ type: "text", text: prompt || "Use these images." }, ...images.map((image) => ({ type: "image" as const, mediaType: image.mediaType, data: image.data }))]
+      : prompt;
+    await this.drive(id, session, Date.now(), null, (signal, onEvent) => session.run(content, { signal, onEvent }));
   }
 
   stop(): void {
@@ -364,26 +624,23 @@ export class DesignRuntime {
   }
 
   async hide(id: string): Promise<void> {
-    const meta = this.meta.get(id);
-    if (!meta) return;
     this.live.get(id)?.controller?.abort();
-    await this.saveMeta({ ...meta, hidden: true });
+    await api(`/api/chats/${encodeURIComponent(id)}`, { method: "PATCH", body: { hidden: true } }).catch(() => {});
     if (this.state.active.id === id) this.newDesign();
-    this.set({ chats: this.summaries() });
+    await this.refreshChats().catch(() => {});
   }
 
   /** Development checks, run from the browser console or the e2e script. */
   debug() {
     return {
+      /** The SDK's storage contract against the server-backed Storage. Run it as a separate dev user: it leaves two chats. */
       checkStorage: async () => {
-        const database = openDatabase(`tinyagent-design-check-${Date.now()}`);
-        await checkStorage(new JournalStorage(new IdbJournalBackend(database)));
-        return "checkStorage passed on IndexedDB";
+        await checkStorage(new ServerStorage(`tab-check-${crypto.randomUUID()}`));
+        return "checkStorage passed on the server-backed storage";
       },
-      designs: (id: string) => this.db.designs(id),
-      records: (id: string) => this.sessions.get(id)?.records ?? [],
+      designs: (id: string) => api<{ designs: DesignMeta[] }>(`/api/chats/${encodeURIComponent(id)}/designs`).then((response) => response.body.designs),
+      records: (id: string) => this.state.active.id === id ? this.state.active.records : this.sessions.get(id)?.records ?? [],
+      owner: this.owner,
     };
   }
 }
-
-export { errorText };

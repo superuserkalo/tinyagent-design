@@ -1,8 +1,16 @@
 "use client";
 
-import { useId, useState, type ReactNode } from "react";
+import { createContext, useContext, useId, useState, type ReactNode } from "react";
 import { FramedQuestion, Close } from "./icons";
 import { button, Dialog, DialogClose, DialogContent, DialogDescription, DialogTitle, Tip } from "./ui";
+
+/** How many free prompts a new account gets, from the server. */
+export const FreePromptsContext = createContext(1);
+
+function FreeLine() {
+  const free = useContext(FreePromptsContext);
+  return <p>Sign in with your radian.sh account and you get {free} free {free === 1 ? "design" : "designs"}.</p>;
+}
 
 export const REPO_URL = "https://github.com/superuserkalo/tinyagent-design";
 export const SDK_URL = "https://github.com/superuserkalo/tinyagent";
@@ -28,11 +36,12 @@ const BODY = (
   <>
     <Section title="when you send">
       <p>The agent loop runs in your browser tab on the TinyAgent SDK. Only the model call goes through our server, which pays for it.</p>
+      <FreeLine />
     </Section>
     <Section title="durable">
       <p>
-        Each chat is a TinyAgent session, journaled step by step in your browser. Close the tab or reload mid-reply and it
-        picks up from the last step.
+        Each chat is a TinyAgent session, journaled step by step and kept with your account, on every device. Close the
+        tab or reload mid-reply and it picks up from the last step.
       </p>
     </Section>
     <Section title="make it yours">

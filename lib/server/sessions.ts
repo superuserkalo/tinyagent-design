@@ -152,13 +152,18 @@ export class SessionStore {
     const chunkId = large ? this.newId() : "";
     const parts = large ? Array.from({ length: Math.ceil(body.length / CHUNK_CHARS) }, (_, index) => body.slice(index * CHUNK_CHARS, (index + 1) * CHUNK_CHARS)) : [];
     const statements = [
+      // The first record creates the chat (the SDK's "expected 0 creates the session").
+      ...(expected === 0 ? [{ sql: SQL.ensureChat, params: [sessionId, userId, "", now] }] : []),
       ...parts.map((part, index) => ({ sql: SQL.chunk, params: [chunkId, index, sessionId, part] })),
       { sql: SQL.append, params: [sessionId, expected, large ? "" : body, chunkId, parts.length, body.length, now, userId, owner] },
       { sql: SQL.touch, params: [sessionId, userId, now] },
     ];
     const results = await this.exec(statements);
-    if (results[parts.length].length) return "ok";
-    return (await this.chat(userId, sessionId)) ? "fenced" : "not_found";
+    if (results[statements.length - 2].length) return "ok";
+    // Fenced, including a session that does not exist yet (the SDK's contract); a chat
+    // that belongs to someone else is not found.
+    const [owners] = await this.exec([{ sql: SQL.owner, params: [sessionId] }]);
+    return owners[0] && owners[0].user_id !== userId ? "not_found" : "fenced";
   }
 
   /** Records after `after`, a page at a time. `next` is set when more remain. */

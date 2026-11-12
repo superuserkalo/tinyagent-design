@@ -1,6 +1,5 @@
-// The SDK's four-method Storage, written once over a small backend interface so the
-// same code runs on IndexedDB in the browser (lib/client/idb.ts) and on memory in the
-// tests. The backend's one hard duty is `appendIfCount`: check the count and write in
+// The SDK's four-method Storage over a small backend interface, with an in-memory
+// backend. The tests use it; the browser uses lib/client/server-storage.ts. The backend's one hard duty is `appendIfCount`: check the count and write in
 // one atomic step, which is what keeps two tabs on one chat from corrupting it.
 import { FencedError, type Item, type Storage } from "tiny-agent-sdk/browser";
 

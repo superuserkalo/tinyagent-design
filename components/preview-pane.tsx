@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import type { StoredDesign } from "@/lib/client/idb";
+import type { DesignMeta } from "@/lib/client/runtime";
 import { HowItWorksPanel } from "./how-it-works";
 import { Copy, Download, Share, Check } from "./icons";
 import { button, Popover, PopoverContent, PopoverTrigger, Tip } from "./ui";
@@ -11,18 +11,18 @@ import { button, Popover, PopoverContent, PopoverTrigger, Tip } from "./ui";
  * without allow-same-origin: an opaque origin that cannot reach this site's cookies,
  * IndexedDB or DOM. The frame asks for its HTML once; each version gets a new frame.
  */
-function DesignFrame({ design }: { design: StoredDesign }) {
+function DesignFrame({ design, html }: { design: DesignMeta; html: string }) {
   const frame = useRef<HTMLIFrameElement>(null);
   useEffect(() => {
     const onMessage = (event: MessageEvent) => {
       const target = frame.current?.contentWindow;
       if (!target || event.source !== target || event.data?.type !== "tinyagent-design-ready") return;
       // The frame's origin is opaque, so "*" is the only target that reaches it. Only the design is sent.
-      target.postMessage({ type: "tinyagent-design", html: design.html }, "*");
+      target.postMessage({ type: "tinyagent-design", html }, "*");
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [design.html]);
+  }, [html]);
   return (
     <iframe
       ref={frame}
@@ -53,8 +53,23 @@ function renderable(html: string): boolean {
   return body != null && /<[a-z]/i.test(html.slice(body.index + body[0].length));
 }
 
-export default function PreviewPane({ designs, viewing, draft, intro, onLatest }: {
-  designs: StoredDesign[];
+/** Loads a version's HTML, then runs it. */
+function LoadedDesign({ design, load }: { design: DesignMeta; load: (id: string) => Promise<string> }) {
+  const [html, setHtml] = useState<{ id: string; html: string } | null>(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    let live = true;
+    setFailed(false);
+    load(design.id).then((value) => { if (live) setHtml({ id: design.id, html: value }); }, () => { if (live) setFailed(true); });
+    return () => { live = false; };
+  }, [design.id, load]);
+  if (failed) return <p className="p-6 text-sm text-muted">This version could not be loaded.</p>;
+  return html?.id === design.id ? <DesignFrame key={design.id} design={design} html={html.html} /> : null;
+}
+
+export default function PreviewPane({ designs, load, viewing, draft, intro, onLatest }: {
+  designs: DesignMeta[];
+  load: ((id: string) => Promise<string>) | null;
   viewing: string | null;
   draft: string | null;
   intro: boolean;
@@ -78,8 +93,8 @@ export default function PreviewPane({ designs, viewing, draft, intro, onLatest }
       <div className="relative min-h-0 flex-1">
         {drafting ? (
           <DraftFrame html={drafting} />
-        ) : shown ? (
-          <DesignFrame key={shown.id} design={shown} />
+        ) : shown && load ? (
+          <LoadedDesign key={shown.id} design={shown} load={load} />
         ) : intro ? (
           <div className="h-full min-h-0 overflow-y-auto">
             <div className="flex min-h-full items-center justify-center px-6 py-10">
@@ -98,23 +113,29 @@ function fileName(title: string): string {
 }
 
 /** Copy or download the design on screen. */
-export function ExportMenu({ design, onNotice }: { design: StoredDesign; onNotice: (text: string) => void }) {
+export function ExportMenu({ design, load, onNotice }: { design: DesignMeta; load: (id: string) => Promise<string>; onNotice: (text: string) => void }) {
   const [open, setOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   async function copy() {
     setOpen(false);
     try {
-      await navigator.clipboard.writeText(design.html);
+      // Safari allows a clipboard write only inside the click: hand it the pending text.
+      const text = load(design.id);
+      if (typeof ClipboardItem !== "undefined" && navigator.clipboard?.write)
+        await navigator.clipboard.write([new ClipboardItem({ "text/plain": text.then((value) => new Blob([value], { type: "text/plain" })) })]);
+      else await navigator.clipboard.writeText(await text);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch {
       onNotice("Unable to copy the design. Try again.");
     }
   }
-  function download() {
+  async function download() {
     setOpen(false);
+    let html: string;
+    try { html = await load(design.id); } catch { return onNotice("Unable to download the design. Try again."); }
     // Octet-stream, so the browser saves it and never renders it on this origin.
-    const url = URL.createObjectURL(new Blob([design.html], { type: "application/octet-stream" }));
+    const url = URL.createObjectURL(new Blob([html], { type: "application/octet-stream" }));
     const link = document.createElement("a");
     link.href = url;
     link.download = fileName(design.title);
@@ -135,7 +156,7 @@ export function ExportMenu({ design, onNotice }: { design: StoredDesign; onNotic
       </Tip>
       <PopoverContent align="end" className="w-52 p-1">
         <button type="button" className={item} onClick={() => void copy()}><span className="text-muted"><Copy /></span>copy HTML</button>
-        <button type="button" className={item} onClick={download}><span className="text-muted"><Download /></span>download HTML</button>
+        <button type="button" className={item} onClick={() => void download()}><span className="text-muted"><Download /></span>download HTML</button>
       </PopoverContent>
     </Popover>
   );
